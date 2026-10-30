@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Doc Scanner</title>
+  <meta name="description" content="Scan documents with your laptop camera into Google Drive or Google Classroom.">
+  <meta name="theme-color" content="#1a73e8">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h7l5 5v11a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zm6 1.5V9h4.5M8 13h8M8 16.5h8"/></svg>
+      <span>Doc Scanner</span>
+    </div>
+    <div class="topbar-right">
+      <span id="cvStatus" class="chip" title="Automatic page edge detection">Loading edge detection…</span>
+      <button id="teacherBtn" class="btn ghost small hidden" type="button">Teacher tools</button>
+      <button id="signInBtn" class="btn ghost small" type="button">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21a8 8 0 0 1 16 0"/></svg>
+        Sign in
+      </button>
+      <div id="account" class="account hidden">
+        <span id="accountEmail" class="account-email"></span>
+        <button id="signOutBtn" class="btn link small" type="button">Sign out</button>
+      </div>
+      <button id="helpBtn" class="icon-btn" type="button" title="Help" aria-label="Help">?</button>
+    </div>
+  </header>
+
+  <div id="targetBanner" class="target-banner hidden">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H4zM2 19h20M9 9h6"/></svg>
+    <div>Scanning for <b id="targetTitle"></b> <span id="targetCourse" class="muted"></span></div>
+    <button id="targetClear" class="btn link small" type="button">Save to Drive instead</button>
+  </div>
+
+  <main class="layout">
+    <section class="stage">
+      <div class="viewport" id="viewport">
+        <video id="video" playsinline muted autoplay></video>
+        <canvas id="overlay"></canvas>
+        <div class="hud">
+          <div class="status-pill" id="statusPill"><span class="dot"></span><span id="statusText">Starting camera…</span></div>
+          <div class="focus-meter" title="How sharp the image is">
+            <span>Focus</span>
+            <div class="bar"><div id="focusFill"></div></div>
+          </div>
+        </div>
+        <div class="flash" id="flash"></div>
+        <div class="camera-error hidden" id="cameraError">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h3l2-2h8l2 2h3v12H3zM12 10a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7zM3 3l18 18"/></svg>
+          <h3 id="cameraErrorTitle">Camera unavailable</h3>
+          <p id="cameraErrorText"></p>
+          <div class="row center">
+            <button id="retryCamera" class="btn primary" type="button">Try again</button>
+            <button id="uploadInstead" class="btn ghost" type="button">Upload photos</button>
+          </div>
+        </div>
+        <div class="drop-hint hidden" id="dropHint">Drop photos to add them as pages</div>
+      </div>
+
+      <div class="controls">
+        <div class="control-group">
+          <label class="toggle" title="Capture automatically when a page is detected, steady and in focus">
+            <input type="checkbox" id="autoToggle" checked>
+            <span class="track"><span class="knob"></span></span>
+            <span>Auto-capture</span>
+          </label>
+        </div>
+        <button id="captureBtn" class="shutter" type="button" title="Capture page (Space)" aria-label="Capture page">
+          <span class="ring"></span><span class="core"></span>
+        </button>
+        <div class="control-group right">
+          <select id="cameraSelect" class="select hidden" title="Choose camera" aria-label="Choose camera"></select>
+          <button id="uploadBtn" class="btn ghost" type="button" title="Add photos from your computer">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7 9m5-5 5 5M4 20h16"/></svg>
+            Upload
+          </button>
+          <input type="file" id="fileInput" accept="image/*" multiple hidden>
+        </div>
+      </div>
+      <p class="hint">Hold the page flat against a darker background and let it fill most of the view. Press <kbd>Space</kbd> to capture.</p>
+    </section>
+
+    <aside class="pages-panel">
+      <div class="panel-head">
+        <h2>Pages <span id="pageCount" class="count">0</span></h2>
+        <button id="clearBtn" class="btn link small hidden" type="button">Clear all</button>
+      </div>
+      <div id="pageList" class="page-list"></div>
+      <div class="panel-foot">
+        <button id="saveBtn" class="btn primary block large" type="button" disabled>Save to Drive</button>
+      </div>
+    </aside>
+  </main>
+
+  <!-- Page editor -->
+  <div class="modal hidden" id="editorModal" role="dialog" aria-modal="true" aria-labelledby="edTitle">
+    <div class="modal-card editor-card">
+      <div class="modal-head">
+        <button class="icon-btn" id="edPrev" type="button" title="Previous page" aria-label="Previous page">‹</button>
+        <h3 id="edTitle">Page 1</h3>
+        <button class="icon-btn" id="edNext" type="button" title="Next page" aria-label="Next page">›</button>
+        <span class="spacer"></span>
+        <button class="icon-btn" data-close type="button" aria-label="Close">×</button>
+      </div>
+      <div class="editor-body">
+        <div class="crop-wrap">
+          <p class="muted small-text">Drag the corners to fit the edges of the page.</p>
+          <div class="crop-area" id="cropArea">
+            <canvas id="cropCanvas"></canvas>
+            <svg id="cropSvg"></svg>
+            <canvas id="loupe" class="loupe hidden" width="132" height="132"></canvas>
+          </div>
+        </div>
+        <div class="editor-side">
+          <div class="preview-box"><img id="previewImg" alt="Page preview"><div class="spinner" id="previewSpin"></div></div>
+          <div class="field-label">Look</div>
+          <div class="seg" id="filterSeg">
+            <button type="button" data-filter="enhanced">Enhanced</button>
+            <button type="button" data-filter="original">Original</button>
+            <button type="button" data-filter="gray">Grayscale</button>
+            <button type="button" data-filter="bw">B&amp;W</button>
+          </div>
+          <button class="btn link small" id="edApplyAll" type="button">Use this look for all pages</button>
+          <div class="field-label">Adjust</div>
+          <div class="btn-grid">
+            <button class="btn ghost" id="edRotL" type="button" title="Rotate left">⟲ Rotate</button>
+            <button class="btn ghost" id="edRotR" type="button" title="Rotate right">Rotate ⟳</button>
+            <button class="btn ghost" id="edAuto" type="button" title="Detect the page edges again">Auto crop</button>
+            <button class="btn ghost" id="edFull" type="button" title="Use the whole photo">No crop</button>
+            <button class="btn ghost" id="edEarlier" type="button">Move earlier</button>
+            <button class="btn ghost" id="edLater" type="button">Move later</button>
+          </div>
+          <button class="btn danger-ghost block" id="edDelete" type="button">Delete page</button>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn primary" data-close type="button">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Save -->
+  <div class="modal hidden" id="saveModal" role="dialog" aria-modal="true" aria-labelledby="saveTitle">
+    <div class="modal-card save-card">
+      <div class="modal-head">
+        <h3 id="saveTitle">Save scan</h3>
+        <span class="spacer"></span>
+        <button class="icon-btn" data-close type="button" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <label class="field">
+          <span class="field-label">File name</span>
+          <div class="input-suffix"><input id="fileName" type="text" autocomplete="off" spellcheck="false"><span>.pdf</span></div>
+        </label>
+
+        <div class="tabs" role="tablist">
+          <button type="button" role="tab" data-tab="drive" class="active">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            Google Drive
+          </button>
+          <button type="button" role="tab" data-tab="classroom">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H4zM2 19h20M9 9h6"/></svg>
+            Google Classroom
+          </button>
+        </div>
+
+        <div id="tabDrive" class="tab-panel">
+          <div class="dest">
+            <svg class="folder-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            <div class="dest-text">
+              <div class="dest-name" id="destName">My Drive</div>
+              <div class="dest-path" id="destPath"></div>
+            </div>
+            <button id="browseBtn" class="btn ghost small" type="button">Change</button>
+          </div>
+          <div id="recentWrap">
+            <div class="field-label">Recent folders</div>
+            <div id="recentChips" class="chips"></div>
+          </div>
+
+          <div class="browser hidden" id="browser">
+            <div class="browser-top">
+              <input type="search" id="folderSearch" placeholder="Search all folders…" autocomplete="off">
+              <button id="newFolderBtn" class="btn ghost small" type="button">+ New folder</button>
+            </div>
+            <nav class="crumbs" id="crumbs"></nav>
+            <div class="new-folder hidden" id="newFolderRow">
+              <input type="text" id="newFolderName" placeholder="New folder name" autocomplete="off">
+              <button class="btn primary small" id="newFolderCreate" type="button">Create</button>
+            </div>
+            <ul class="folder-list" id="folderList"></ul>
+            <div class="browser-foot">
+              <button id="useFolderBtn" class="btn primary small" type="button">Use this folder</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="tabClassroom" class="tab-panel hidden">
+          <label class="field">
+            <span class="field-label">Class</span>
+            <select id="courseSelect" class="select block"></select>
+          </label>
+          <div class="field-label">Assignment</div>
+          <div id="assignmentList" class="assignment-list"></div>
+          <label class="check"><input type="checkbox" id="turnInCheck" checked> Turn in after attaching</label>
+        </div>
+
+        <p class="form-error hidden" id="saveError"></p>
+      </div>
+      <div class="modal-foot">
+        <span class="muted small-text" id="saveSize"></span>
+        <span class="spacer"></span>
+        <button class="btn ghost" data-close type="button">Cancel</button>
+        <button class="btn primary" id="confirmSave" type="button">Save</button>
+      </div>
+      <div class="busy hidden" id="saveBusy"><div class="spinner"></div><p id="saveBusyText">Saving…</p></div>
+    </div>
+  </div>
+
+  <!-- Result -->
+  <div class="modal hidden" id="resultModal" role="dialog" aria-modal="true" aria-labelledby="resultTitle">
+    <div class="modal-card result-card">
+      <div class="result-icon" id="resultIcon"></div>
+      <h3 id="resultTitle"></h3>
+      <div id="resultBody" class="result-body"></div>
+      <div class="result-actions" id="resultActions"></div>
+    </div>
+  </div>
+
+  <!-- Teacher tools -->
+  <div class="modal hidden" id="teacherModal" role="dialog" aria-modal="true" aria-labelledby="teacherTitle">
+    <div class="modal-card save-card">
+      <div class="modal-head">
+        <h3 id="teacherTitle">Teacher tools</h3>
+        <span class="spacer"></span>
+        <button class="icon-btn" data-close type="button" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <label class="field">
+          <span class="field-label">Class</span>
+          <select id="tCourse" class="select block"></select>
+        </label>
+        <div class="tabs" role="tablist">
+          <button type="button" role="tab" data-ttab="create" class="active">New scan assignment</button>
+          <button type="button" role="tab" data-ttab="link">Link for existing assignment</button>
+        </div>
+        <div id="tCreate" class="tab-panel">
+          <p class="muted small-text">Assignments created here support one-click turn in: students scan and the PDF is attached and turned in for them.</p>
+          <label class="field"><span class="field-label">Title</span><input id="tTitle" type="text"></label>
+          <label class="field"><span class="field-label">Instructions</span><textarea id="tDesc" rows="3"></textarea></label>
+          <div class="row">
+            <label class="field grow"><span class="field-label">Due (optional)</span><input id="tDue" type="datetime-local"></label>
+            <label class="field"><span class="field-label">Points</span><input id="tPoints" type="number" min="0" value="100" class="narrow"></label>
+          </div>
+          <button class="btn primary" id="tCreateBtn" type="button">Create &amp; post assignment</button>
+        </div>
+        <div id="tLink" class="tab-panel hidden">
+          <p class="muted small-text">Paste a scanner link into any assignment. Students land in the scanner with that assignment already picked. Assignments not created here open Classroom so students can attach the file.</p>
+          <div id="tWorkList" class="assignment-list"></div>
+        </div>
+        <div id="tResult" class="notice hidden"></div>
+        <p class="form-error hidden" id="tError"></p>
+      </div>
+      <div class="busy hidden" id="tBusy"><div class="spinner"></div><p>Working…</p></div>
+    </div>
+  </div>
+
+  <!-- Help -->
+  <div class="modal hidden" id="helpModal" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
+    <div class="modal-card help-card">
+      <div class="modal-head">
+        <h3 id="helpTitle">Scanning tips</h3>
+        <span class="spacer"></span>
+        <button class="icon-btn" data-close type="button" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+        <ol class="tips">
+          <li><b>Hold the page up to the camera</b>, flat, filling most of the view. A darker background behind it helps the edges stand out.</li>
+          <li><b>Watch the outline.</b> It turns green when the page is found, steady and in focus. With Auto-capture on, the page is captured for you.</li>
+          <li><b>Show the next page</b> and it captures again. Each page is straightened and cleaned up automatically.</li>
+          <li><b>Click a page</b> to fix the corners, rotate it, change its look, reorder or delete it. Drag pages in the list to reorder them.</li>
+          <li><b>Save</b> to a Drive folder as a PDF, or turn it in to a Google Classroom assignment.</li>
+        </ol>
+        <div class="field-label">Shortcuts</div>
+        <ul class="keys">
+          <li><kbd>Space</kbd> capture a page</li>
+          <li><kbd>A</kbd> turn auto-capture on or off</li>
+          <li><kbd>S</kbd> save</li>
+          <li><kbd>Esc</kbd> close a window</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast hidden" id="toast" role="status"><span id="toastText"></span><button id="toastAction" class="btn link small hidden" type="button"></button></div>
+
+  <script src="config.js"></script>
+  <script src="vision.js"></script>
+  <script src="google.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

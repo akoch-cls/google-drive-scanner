@@ -1,0 +1,382 @@
+/**
+ * Vision: the image processing behind the scanner.
+ *
+ *  - detectQuad:  finds the page outline in a frame (needs OpenCV.js)
+ *  - sharpness:   variance of the Laplacian, a standard focus measure
+ *  - warp:        perspective correction (de-skew) of the page to a flat rectangle
+ *  - applyFilter: shadow removal + contrast for a clean "scanned" look
+ *
+ * Everything except detectQuad is plain JavaScript, so the app keeps working
+ * (with manual cropping) if OpenCV can't be loaded.
+ */
+const Vision = (() => {
+  'use strict';
+
+  function createCanvas(w, h) {
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(w));
+    c.height = Math.max(1, Math.round(h));
+    return c;
+  }
+
+  function ctx2d(canvas) {
+    return canvas.getContext('2d', { willReadFrequently: true });
+  }
+
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+  /** Puts 4 points in top-left, top-right, bottom-right, bottom-left order. */
+  function orderCorners(pts) {
+    const cx = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+    const cy = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+    const sorted = pts.slice().sort((a, b) =>
+      Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx));
+    let start = 0;
+    sorted.forEach((p, i) => {
+      if (p.x + p.y < sorted[start].x + sorted[start].y) start = i;
+    });
+    return sorted.slice(start).concat(sorted.slice(0, start));
+  }
+
+  function fullFrame(w, h) {
+    return [{ x: 0, y: 0 }, { x: w, y: 0 }, { x: w, y: h }, { x: 0, y: h }];
+  }
+
+  function polygonArea(pts) {
+    let a = 0;
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i], q = pts[(i + 1) % pts.length];
+      a += p.x * q.y - q.x * p.y;
+    }
+    return Math.abs(a) / 2;
+  }
+
+  // -------------------------------------------------------------------------
+  // Frame analysis (focus + motion)
+  // -------------------------------------------------------------------------
+
+  function toGray(imageData) {
+    const d = imageData.data, n = imageData.width * imageData.height;
+    const g = new Uint8Array(n);
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      g[i] = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;
+    }
+    return g;
+  }
+
+  /** Average brightness change between two frames (0–255). Used to tell if the camera is steady. */
+  function meanAbsDiff(a, b) {
+    let sum = 0, n = 0;
+    for (let i = 0; i < a.length; i += 3) {
+      sum += Math.abs(a[i] - b[i]);
+      n++;
+    }
+    return sum / n;
+  }
+
+  /** Variance of the Laplacian: high when edges are crisp, low when blurry. */
+  function sharpness(imageData) {
+    const w = imageData.width, h = imageData.height;
+    const g = toGray(imageData);
+    let sum = 0, sum2 = 0, n = 0;
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1, i = y * w + 1; x < w - 1; x++, i++) {
+        const lap = 4 * g[i] - g[i - 1] - g[i + 1] - g[i - w] - g[i + w];
+        sum += lap;
+        sum2 += lap * lap;
+        n++;
+      }
+    }
+    if (!n) return 0;
+    const mean = sum / n;
+    return sum2 / n - mean * mean;
+  }
+
+  // -------------------------------------------------------------------------
+  // Page detection (OpenCV.js)
+  // -------------------------------------------------------------------------
+
+  function median(u8) {
+    const hist = new Uint32Array(256);
+    for (let i = 0; i < u8.length; i++) hist[u8[i]]++;
+    let acc = 0;
+    const half = u8.length / 2;
+    for (let v = 0; v < 256; v++) {
+      acc += hist[v];
+      if (acc >= half) return v;
+    }
+    return 128;
+  }
+
+  /**
+   * Finds the largest 4-sided shape in the image that looks like a page.
+   * Returns 4 ordered corners in the image's pixel coordinates, or null.
+   */
+  function detectQuad(imageData, minAreaRatio = 0.12) {
+    const cv = window.cv;
+    if (!cv || !cv.Mat) return null;
+    const w = imageData.width, h = imageData.height;
+    const frameArea = w * h;
+
+    const src = cv.matFromImageData(imageData);
+    const gray = new cv.Mat();
+    const edges = new cv.Mat();
+    const contours = new cv.MatVector();
+    const hierarchy = new cv.Mat();
+    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+    let best = null, bestArea = 0;
+
+    try {
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+      cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0);
+      // "Auto Canny": thresholds based on the median brightness of the scene.
+      const med = median(gray.data);
+      const lo = Math.max(20, 0.66 * med), hi = Math.max(60, Math.min(255, 1.33 * med));
+      cv.Canny(gray, edges, lo, hi);
+      cv.dilate(edges, edges, kernel); // close small gaps in the page outline
+      cv.findContours(edges, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+
+      for (let i = 0; i < contours.size(); i++) {
+        const c = contours.get(i);
+        if (cv.contourArea(c) < frameArea * minAreaRatio * 0.6) { c.delete(); continue; }
+        // The convex hull ignores fingers holding the page.
+        const hull = new cv.Mat();
+        cv.convexHull(c, hull);
+        const peri = cv.arcLength(hull, true);
+        for (const eps of [0.02, 0.035, 0.05]) {
+          const approx = new cv.Mat();
+          cv.approxPolyDP(hull, approx, eps * peri, true);
+          if (approx.rows === 4) {
+            const d = approx.data32S;
+            const pts = [0, 1, 2, 3].map(k => ({ x: d[k * 2], y: d[k * 2 + 1] }));
+            const area = polygonArea(pts);
+            if (area > bestArea && area >= frameArea * minAreaRatio &&
+                area < frameArea * 0.985 && looksLikePage(pts)) {
+              best = pts;
+              bestArea = area;
+            }
+            approx.delete();
+            break;
+          }
+          approx.delete();
+        }
+        hull.delete();
+        c.delete();
+      }
+    } finally {
+      src.delete(); gray.delete(); edges.delete();
+      contours.delete(); hierarchy.delete(); kernel.delete();
+    }
+    return best ? inset(orderCorners(best), 0.012) : null;
+  }
+
+  /** Pulls corners slightly toward the centre so the background doesn't show at the edges. */
+  function inset(pts, amount) {
+    const cx = pts.reduce((s, p) => s + p.x, 0) / 4;
+    const cy = pts.reduce((s, p) => s + p.y, 0) / 4;
+    return pts.map(p => ({ x: p.x + (cx - p.x) * amount * 2, y: p.y + (cy - p.y) * amount * 2 }));
+  }
+
+  /** Rejects slivers and badly distorted shapes. */
+  function looksLikePage(pts) {
+    const [a, b, c, d] = orderCorners(pts);
+    const top = dist(a, b), bottom = dist(d, c), left = dist(a, d), right = dist(b, c);
+    const ratio = Math.min(top, bottom, left, right) / Math.max(top, bottom, left, right);
+    return ratio > 0.25 && Math.min(top, bottom) / Math.max(top, bottom) > 0.5 &&
+      Math.min(left, right) / Math.max(left, right) > 0.5;
+  }
+
+  // -------------------------------------------------------------------------
+  // Perspective correction
+  // -------------------------------------------------------------------------
+
+  /**
+   * Projective mapping from the unit square to a quad (Heckbert, 1989).
+   * (0,0)->p0, (1,0)->p1, (1,1)->p2, (0,1)->p3
+   */
+  function squareToQuad(p) {
+    const [p0, p1, p2, p3] = p;
+    const dx1 = p1.x - p2.x, dx2 = p3.x - p2.x, dy1 = p1.y - p2.y, dy2 = p3.y - p2.y;
+    const sx = p0.x - p1.x + p2.x - p3.x, sy = p0.y - p1.y + p2.y - p3.y;
+    const den = dx1 * dy2 - dx2 * dy1 || 1e-9;
+    const g = (sx * dy2 - dx2 * sy) / den;
+    const h = (dx1 * sy - sx * dy1) / den;
+    return {
+      a: p1.x - p0.x + g * p1.x, b: p3.x - p0.x + h * p3.x, c: p0.x,
+      d: p1.y - p0.y + g * p1.y, e: p3.y - p0.y + h * p3.y, f: p0.y,
+      g, h
+    };
+  }
+
+  /** Output size for a quad: the longest of each pair of opposite edges. */
+  function quadSize(corners) {
+    const [tl, tr, br, bl] = corners;
+    return {
+      w: Math.max(dist(tl, tr), dist(bl, br)),
+      h: Math.max(dist(tl, bl), dist(tr, br))
+    };
+  }
+
+  /**
+   * Cuts the quad out of the source and flattens it into a rectangle.
+   * @param {HTMLCanvasElement|ImageBitmap} source
+   */
+  function warp(source, corners, maxDim) {
+    let { w, h } = quadSize(corners);
+    let scale = Math.min(1, maxDim / Math.max(w, h));
+
+    // Let the browser downscale first (better quality than point sampling).
+    const srcW = Math.round(source.width * scale), srcH = Math.round(source.height * scale);
+    const src = createCanvas(srcW, srcH);
+    const sctx = ctx2d(src);
+    sctx.imageSmoothingQuality = 'high';
+    sctx.drawImage(source, 0, 0, srcW, srcH);
+    const quad = corners.map(p => ({ x: p.x * scale, y: p.y * scale }));
+    const W = Math.max(1, Math.round(w * scale)), H = Math.max(1, Math.round(h * scale));
+
+    const sd = sctx.getImageData(0, 0, srcW, srcH).data;
+    const out = createCanvas(W, H);
+    const octx = ctx2d(out);
+    const img = octx.createImageData(W, H);
+    const od = img.data;
+    const m = squareToQuad(quad);
+    const maxX = srcW - 1, maxY = srcH - 1;
+
+    let o = 0;
+    for (let y = 0; y < H; y++) {
+      const v = (y + 0.5) / H;
+      for (let x = 0; x < W; x++, o += 4) {
+        const u = (x + 0.5) / W;
+        const den = m.g * u + m.h * v + 1;
+        let fx = (m.a * u + m.b * v + m.c) / den - 0.5;
+        let fy = (m.d * u + m.e * v + m.f) / den - 0.5;
+        fx = fx < 0 ? 0 : fx > maxX ? maxX : fx;
+        fy = fy < 0 ? 0 : fy > maxY ? maxY : fy;
+        const x0 = fx | 0, y0 = fy | 0;
+        const x1 = x0 < maxX ? x0 + 1 : x0, y1 = y0 < maxY ? y0 + 1 : y0;
+        const ax = fx - x0, ay = fy - y0;
+        const i00 = (y0 * srcW + x0) * 4, i10 = (y0 * srcW + x1) * 4;
+        const i01 = (y1 * srcW + x0) * 4, i11 = (y1 * srcW + x1) * 4;
+        for (let ch = 0; ch < 3; ch++) {
+          const top = sd[i00 + ch] + (sd[i10 + ch] - sd[i00 + ch]) * ax;
+          const bot = sd[i01 + ch] + (sd[i11 + ch] - sd[i01 + ch]) * ax;
+          od[o + ch] = top + (bot - top) * ay;
+        }
+        od[o + 3] = 255;
+      }
+    }
+    octx.putImageData(img, 0, 0);
+    return out;
+  }
+
+  function rotate(canvas, degrees) {
+    const deg = ((degrees % 360) + 360) % 360;
+    if (!deg) return canvas;
+    const swap = deg === 90 || deg === 270;
+    const out = createCanvas(swap ? canvas.height : canvas.width, swap ? canvas.width : canvas.height);
+    const ctx = ctx2d(out);
+    ctx.translate(out.width / 2, out.height / 2);
+    ctx.rotate(deg * Math.PI / 180);
+    ctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
+    return out;
+  }
+
+  // -------------------------------------------------------------------------
+  // Clean-up filters
+  // -------------------------------------------------------------------------
+
+  /** Separable max filter on one RGBA channel, in place. */
+  function dilateChannel(d, w, h, ch, r) {
+    const tmp = new Uint8ClampedArray(w * h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let m = 0;
+        for (let k = Math.max(0, x - r); k <= Math.min(w - 1, x + r); k++) m = Math.max(m, d[(y * w + k) * 4 + ch]);
+        tmp[y * w + x] = m;
+      }
+    }
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let m = 0;
+        for (let k = Math.max(0, y - r); k <= Math.min(h - 1, y + r); k++) m = Math.max(m, tmp[k * w + x]);
+        d[(y * w + x) * 4 + ch] = m;
+      }
+    }
+  }
+
+  /**
+   * Estimates how bright the paper is at every point (the lighting), by
+   * shrinking the page and erasing the ink with a max filter.
+   * Dividing by this removes shadows and uneven light.
+   */
+  function estimatePaper(canvas) {
+    const w = canvas.width, h = canvas.height;
+    const k = Math.max(w, h) / 96;
+    const sw = Math.max(8, Math.round(w / k)), sh = Math.max(8, Math.round(h / k));
+    // Two-step shrink so the browser averages pixels rather than skipping them.
+    const mid = createCanvas(sw * 4, sh * 4);
+    const mctx = ctx2d(mid);
+    mctx.imageSmoothingQuality = 'high';
+    mctx.drawImage(canvas, 0, 0, mid.width, mid.height);
+    const small = createCanvas(sw, sh);
+    const sctx = ctx2d(small);
+    sctx.imageSmoothingQuality = 'high';
+    sctx.drawImage(mid, 0, 0, sw, sh);
+
+    const img = sctx.getImageData(0, 0, sw, sh);
+    for (let ch = 0; ch < 3; ch++) dilateChannel(img.data, sw, sh, ch, 2);
+    sctx.putImageData(img, 0, 0);
+
+    const big = createCanvas(w, h);
+    const bctx = ctx2d(big);
+    bctx.imageSmoothingQuality = 'high';
+    bctx.filter = 'blur(' + Math.max(2, Math.round(k * 2)) + 'px)';
+    bctx.drawImage(small, 0, 0, w, h);
+    return bctx.getImageData(0, 0, w, h).data;
+  }
+
+  // Maps normalised brightness to output: deepens ink, pushes paper to white.
+  const LEVELS = (() => {
+    const lut = new Uint8ClampedArray(256);
+    for (let v = 0; v < 256; v++) {
+      const t = Math.min(1, Math.max(0, (v - 25) / (235 - 25)));
+      lut[v] = Math.round(Math.pow(t, 1.25) * 255);
+    }
+    return lut;
+  })();
+
+  /**
+   * @param {'enhanced'|'original'|'gray'|'bw'} filter
+   */
+  function applyFilter(canvas, filter) {
+    if (!filter || filter === 'original') return canvas;
+    const w = canvas.width, h = canvas.height;
+    const ctx = ctx2d(canvas);
+    const img = ctx.getImageData(0, 0, w, h);
+    const d = img.data;
+    const paper = estimatePaper(canvas);
+
+    for (let i = 0; i < d.length; i += 4) {
+      const r = Math.min(255, d[i] * 255 / Math.max(paper[i], 24));
+      const g = Math.min(255, d[i + 1] * 255 / Math.max(paper[i + 1], 24));
+      const b = Math.min(255, d[i + 2] * 255 / Math.max(paper[i + 2], 24));
+      if (filter === 'enhanced') {
+        d[i] = LEVELS[r | 0];
+        d[i + 1] = LEVELS[g | 0];
+        d[i + 2] = LEVELS[b | 0];
+      } else {
+        const y = (r * 77 + g * 150 + b * 29) >> 8;
+        const v = filter === 'bw' ? (y < 200 ? 0 : 255) : LEVELS[y];
+        d[i] = d[i + 1] = d[i + 2] = v;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    return canvas;
+  }
+
+  return {
+    createCanvas, ctx2d, orderCorners, fullFrame, polygonArea,
+    toGray, meanAbsDiff, sharpness,
+    detectQuad, warp, rotate, applyFilter, quadSize
+  };
+})();

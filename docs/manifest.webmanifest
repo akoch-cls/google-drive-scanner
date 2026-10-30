@@ -1,0 +1,11 @@
+{
+  "name": "Doc Scanner",
+  "short_name": "Scanner",
+  "description": "Scan documents with your camera into Google Drive or Google Classroom.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f4f6f9",
+  "theme_color": "#1a73e8",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}
