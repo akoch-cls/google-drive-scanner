@@ -163,6 +163,12 @@
   .controls { flex: none; display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 12px; }
   .control-group { display: flex; align-items: center; gap: 8px; min-width: 0; }
   .control-group.right { justify-content: flex-end; }
+  .tip {
+    flex: none; display: flex; align-items: flex-start; gap: 10px; padding: 10px 14px; border-radius: 12px;
+    background: var(--accent-soft); font-size: 13px; line-height: 1.45;
+  }
+  .tip svg { color: var(--accent); margin-top: 1px; }
+  .tip div { flex: 1; }
   .hint { margin: 0; text-align: center; color: var(--muted); font-size: 12.5px; }
 
   .shutter {

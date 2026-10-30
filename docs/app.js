@@ -56,7 +56,7 @@
     'turnInCheck', 'saveError', 'saveSize', 'confirmSave', 'saveBusy', 'saveBusyText', 'resultModal',
     'resultIcon', 'resultTitle', 'resultBody', 'resultActions', 'teacherModal', 'tCourse', 'tCreate', 'tLink',
     'tTitle', 'tDesc', 'tDue', 'tPoints', 'tCreateBtn', 'tWorkList', 'tResult', 'tError', 'tBusy', 'helpModal',
-    'toast', 'toastText', 'toastAction', 'edFingers', 'signInBtn', 'account', 'accountEmail', 'signOutBtn'
+    'toast', 'toastText', 'toastAction', 'edFingers', 'macTip', 'macTipClose', 'signInBtn', 'account', 'accountEmail', 'signOutBtn'
   ].forEach(id => { el[id] = $(id); });
 
   const state = {
@@ -72,7 +72,8 @@
     quad: null,          // detected page corners, normalised 0..1
     quadStable: false,
     quadMiss: 0,
-    focus: { raw: 0, history: [], typical: 0, rel: 0, sharp: false },
+    quadCut: false,      // the page runs off the edge of the frame
+    focus: { raw: 0, history: [], typical: 0, rel: 0, sharp: false, log: [] },
     auto: { armed: true, count: 0, disturbed: 0, lastCapture: 0, justCaptured: -Infinity, captured: 0 },
     openModals: [],
     dest: null,          // {id, name, path}
@@ -347,6 +348,7 @@
       try { found = Vision.detectQuad(frame); } catch (err) { console.warn('detect failed', err); }
     }
     updateQuad(found, sw, sh);
+    if (found) state.quadCut = !!found.touchesEdge;
 
     const q = state.quad;
     const r = focusRegion(vw, vh);
@@ -418,10 +420,18 @@
     const rel = f.typical > 0 ? raw / f.typical : 0;
     f.rel = f.rel * 0.4 + rel * 0.6;
     f.sharp = f.rel >= CONFIG.relSharpness && raw >= CONFIG.minSharpness;
+    f.log.push(f.sharp);
+    if (f.log.length > CONFIG.autoFrames) f.log.shift();
 
     const level = raw < CONFIG.minSharpness ? 0.3 * raw / CONFIG.minSharpness : Math.min(1, f.rel);
     el.focusFill.style.width = Math.round(level * 100) + '%';
     el.focusFill.style.background = f.sharp ? '#34d058' : level > 0.5 ? '#ffb020' : '#ff5b4f';
+  }
+
+  /** True when at least half of the recent frames were sharp. */
+  function mostlySharp() {
+    const log = state.focus.log;
+    return log.length > 0 && log.filter(Boolean).length * 2 >= Math.min(log.length, CONFIG.autoFrames);
   }
 
   function updateAuto(hasPage, steady, motion) {
@@ -435,7 +445,8 @@
         a.disturbed = 0;
       }
     }
-    const ready = hasPage && steady && state.focus.sharp;
+    // Every frame doesn't have to be sharp: the capture burst keeps the sharpest one.
+    const ready = hasPage && !state.quadCut && steady && mostlySharp();
     a.count = ready ? a.count + 1 : 0;
     const progress = state.autoEnabled && a.armed ? Math.min(1, a.count / CONFIG.autoFrames) : 0;
     el.captureBtn.style.setProperty('--p', progress.toFixed(2));
@@ -454,9 +465,11 @@
       setStatus('Page ' + a.captured + ' captured' + (state.autoEnabled ? ' — show the next page' : ''), 'good');
     } else if (!state.quad) {
       setStatus(state.cvReady ? 'Hold a page up to the camera' : 'Frame the page, then capture', state.cvReady ? '' : 'warn');
+    } else if (state.quadCut) {
+      setStatus('Move the page back so all four corners are in view', 'warn');
     } else if (!steady) {
       setStatus('Hold steady…', 'warn');
-    } else if (!state.focus.sharp) {
+    } else if (!mostlySharp()) {
       setStatus('Blurry — hold still a moment', 'warn');
     } else if (state.autoEnabled && !a.armed) {
       setStatus('Captured — show the next page', 'good');
@@ -501,9 +514,9 @@
       return;
     }
 
-    const ready = steady && state.focus.sharp;
+    const ready = !state.quadCut && steady && mostlySharp();
     const pts = state.quad.map(p => ({ x: r.x + p.x * r.w, y: r.y + p.y * r.h }));
-    const color = ready ? '52,208,88' : '138,180,248';
+    const color = ready ? '52,208,88' : state.quadCut ? '255,176,32' : '138,180,248';
     ctx.beginPath();
     pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
     ctx.closePath();
@@ -1668,6 +1681,21 @@
     }
   });
 
+  /**
+   * Macs (and iPads) have Center Stage, which pans and zooms to follow your
+   * face. That moves the whole picture, so the page never looks steady.
+   * Web pages can't switch it off, so explain how.
+   */
+  function showMacTip() {
+    const apple = /Macintosh|Mac OS X|iPad/.test(navigator.userAgent);
+    if (!apple || store('macTipDismissed')) return;
+    el.macTip.classList.remove('hidden');
+  }
+  el.macTipClose.addEventListener('click', () => {
+    el.macTip.classList.add('hidden');
+    store('macTipDismissed', true);
+  });
+
   // ===========================================================================
   // Sign-in
   // ===========================================================================
@@ -1724,6 +1752,7 @@
 
     loadOpenCv();
     startCamera(store('camera'));
+    showMacTip();
 
     state.recent = store('recentFolders') || [];
     if (!state.dest) state.dest = state.recent[0] || null;

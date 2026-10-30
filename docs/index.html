@@ -83,7 +83,14 @@
           <input type="file" id="fileInput" accept="image/*" multiple hidden>
         </div>
       </div>
-      <p class="hint">Hold the page flat against a darker background and let it fill most of the view. Press <kbd>Space</kbd> to capture.</p>
+      <div class="tip hidden" id="macTip" role="note">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8h.01M11 12h1v5h1M12 3a9 9 0 1 1 0 18 9 9 0 0 1 0-18z"/></svg>
+        <div><b>On a Mac? Turn off Center Stage.</b> It makes the camera follow your face, so the page never holds still.
+          While the camera is on, click the <b>green camera icon</b> in the menu bar (or <b>Control Center → Video Effects</b>)
+          and switch off <b>Center Stage</b>. Turn off <b>Portrait</b> too if it's on.</div>
+        <button class="btn link small" id="macTipClose" type="button">Got it</button>
+      </div>
+      <p class="hint">Hold the page by its sides, with all four corners in view. A plain background behind it helps. Press <kbd>Space</kbd> to capture.</p>
     </section>
 
     <aside class="pages-panel">
@@ -284,7 +291,8 @@
       </div>
       <div class="modal-body">
         <ol class="tips">
-          <li><b>Hold the page up to the camera</b>, flat, filling most of the view. A darker background behind it helps the edges stand out.</li>
+          <li><b>Hold the page up to the camera</b> by its sides, flat, with all four corners in view. A plain background behind it helps.</li>
+          <li><b>On a Mac, turn off Center Stage</b> (green camera icon in the menu bar, or Control Center → Video Effects). Otherwise the camera follows your face and the page never holds still.</li>
           <li><b>Watch the outline.</b> It turns green when the page is found, steady and in focus. With Auto-capture on, the page is captured for you.</li>
           <li><b>Show the next page</b> and it captures again. Each page is straightened and cleaned up automatically.</li>
           <li><b>Click a page</b> to fix the corners, rotate it, change its look, reorder or delete it. Drag pages in the list to reorder them.</li>
