@@ -6,6 +6,8 @@
   <?!= include('Styles'); ?>
 </head>
 <body>
+  <!-- The UI lives in a template so it can also be stamped into the pop-out scanner window. -->
+  <template id="app-markup">
   <header class="topbar">
     <div class="brand">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h7l5 5v11a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zm6 1.5V9h4.5M8 13h8M8 16.5h8"/></svg>
@@ -45,6 +47,17 @@
             <button id="retryCamera" class="btn primary" type="button">Try again</button>
             <button id="uploadInstead" class="btn ghost" type="button">Upload photos</button>
           </div>
+          <button id="popoutFromError" class="btn link hidden" type="button">Open the scanner in its own window instead</button>
+        </div>
+        <div class="camera-error hidden" id="popoutPanel">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4l-8 8M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>
+          <h3 id="popoutTitle">Open the scanner window</h3>
+          <p id="popoutText">Google doesn't allow the camera on pages embedded in Apps Script, so the scanner opens in its own window. Everything still saves to your Drive and Classroom.</p>
+          <div class="row center">
+            <button id="popoutBtn" class="btn primary large" type="button">Open scanner window</button>
+            <button id="popoutUpload" class="btn ghost" type="button">Upload photos</button>
+          </div>
+          <p class="popout-note">Keep this tab open while you scan. If nothing happens, allow pop-ups for this site.</p>
         </div>
         <div class="drop-hint hidden" id="dropHint">Drop photos to add them as pages</div>
       </div>
@@ -285,6 +298,9 @@
   </div>
 
   <div class="toast hidden" id="toast" role="status"><span id="toastText"></span><button id="toastAction" class="btn link small hidden" type="button"></button></div>
+
+  </template>
+  <script>document.body.prepend(document.getElementById('app-markup').content.cloneNode(true));</script>
 
   <?!= include('Vision'); ?>
   <?!= include('App'); ?>

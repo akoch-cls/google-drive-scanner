@@ -1,4 +1,4 @@
-<script>
+<script id="app-src">
 (() => {
   'use strict';
 
@@ -35,6 +35,13 @@
     chevron: '<svg viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg>'
   };
 
+  // Apps Script serves the page in a frame that isn't allowed to use the camera.
+  // In that case the whole app is copied into its own top-level window (the
+  // "pop-out"), which can use the camera, and server calls are relayed back
+  // through this frame, where google.script.run lives.
+  const HOST = window.__scannerHost || null;   // set when running in the pop-out
+  const FRAMED = !HOST && window.top !== window;
+
   const $ = id => document.getElementById(id);
   const el = {};
   [
@@ -50,7 +57,8 @@
     'turnInCheck', 'saveError', 'saveSize', 'confirmSave', 'saveBusy', 'saveBusyText', 'resultModal',
     'resultIcon', 'resultTitle', 'resultBody', 'resultActions', 'teacherModal', 'tCourse', 'tCreate', 'tLink',
     'tTitle', 'tDesc', 'tDue', 'tPoints', 'tCreateBtn', 'tWorkList', 'tResult', 'tError', 'tBusy', 'helpModal',
-    'toast', 'toastText', 'toastAction'
+    'toast', 'toastText', 'toastAction', 'popoutPanel', 'popoutTitle', 'popoutText', 'popoutBtn',
+    'popoutUpload', 'popoutFromError'
   ].forEach(id => { el[id] = $(id); });
 
   const state = {
@@ -88,6 +96,18 @@
   // ===========================================================================
 
   function server(fn, ...args) {
+    if (HOST) {
+      // Arguments and results cross windows as JSON so each side gets plain objects of its own.
+      let call;
+      try {
+        call = HOST.call(fn, JSON.stringify(args));
+      } catch (err) {
+        return Promise.reject(new Error('The original Doc Scanner tab was closed. Open the web app again to save.'));
+      }
+      return Promise.resolve(call).then(
+        json => JSON.parse(json),
+        err => { throw new Error(String(err && err.message || err)); });
+    }
     return new Promise((resolve, reject) => {
       if (typeof google === 'undefined' || !google.script) {
         reject(new Error('Not running inside Apps Script.'));
@@ -100,6 +120,7 @@
   }
 
   function urlParams() {
+    if (HOST) return Promise.resolve(JSON.parse(HOST.params || '{}'));
     return new Promise(resolve => {
       try {
         google.script.url.getLocation(loc => resolve(loc.parameter || {}));
@@ -314,8 +335,96 @@
     el.cameraErrorTitle.textContent = title;
     el.cameraErrorText.textContent = text;
     el.cameraError.classList.remove('hidden');
+    el.popoutFromError.classList.toggle('hidden', !FRAMED);
     el.captureBtn.disabled = true;
     setStatus('No camera', 'bad');
+  }
+
+  // ===========================================================================
+  // Pop-out scanner window (for when the frame can't use the camera)
+  // ===========================================================================
+
+  let popout = null;
+  let popoutTimer = null;
+
+  function cameraBlockedByPolicy() {
+    const policy = document.permissionsPolicy || document.featurePolicy;
+    try {
+      return !!policy && !policy.allowsFeature('camera');
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function showPopoutPanel(open) {
+    stopCamera();
+    el.cameraError.classList.add('hidden');
+    el.popoutPanel.classList.remove('hidden');
+    el.captureBtn.disabled = true;
+    el.popoutTitle.textContent = open ? 'The scanner is open in its own window' : 'Open the scanner window';
+    el.popoutText.textContent = open
+      ? 'Scan and save from the scanner window. Keep this tab open: it connects the scanner to your Drive and Classroom.'
+      : "Google doesn't allow the camera on pages embedded in Apps Script, so the scanner opens in its own window. Everything still saves to your Drive and Classroom.";
+    el.popoutBtn.textContent = open ? 'Show scanner window' : 'Open scanner window';
+    setStatus(open ? 'Scanning in the other window' : 'Open the scanner window to use the camera', open ? 'good' : 'warn');
+  }
+
+  // Relays a server call from the pop-out. Runs in this frame, where google.script.run works.
+  function relay(fn, argsJson) {
+    return server(fn, ...JSON.parse(argsJson)).then(result => JSON.stringify(result === undefined ? null : result));
+  }
+
+  async function openPopout() {
+    if (popout && !popout.closed) {
+      popout.focus();
+      return;
+    }
+    const w = Math.min(1320, screen.availWidth - 40), h = Math.min(860, screen.availHeight - 40);
+    const win = window.open('', 'docScannerWindow',
+      'popup,width=' + w + ',height=' + h + ',left=' + Math.round((screen.availWidth - w) / 2) + ',top=20');
+    if (!win) {
+      toast('Your browser blocked the scanner window. Allow pop-ups for this site, then try again.', null, null, 7000);
+      return;
+    }
+    popout = win;
+    let existing = null;
+    try {
+      existing = win.__scannerHost;
+    } catch (err) {
+      // A window left over from a different origin: replace it.
+    }
+    if (existing) {
+      existing.call = relay; // this tab may have reloaded since the window opened
+    } else {
+      const params = await urlParams();
+      const doc = win.document;
+      doc.open();
+      doc.write('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">' +
+        '<meta name="viewport" content="width=device-width, initial-scale=1"><title>Doc Scanner</title></head><body></body></html>');
+      doc.close();
+      doc.head.appendChild(doc.importNode($('app-styles'), true));
+      doc.body.appendChild(doc.importNode($('app-markup').content, true));
+      win.__scannerHost = { call: relay, params: JSON.stringify(params) };
+      // Re-run the app's scripts inside the new window. Copy the nonce in case a CSP requires it.
+      ['vision-src', 'app-src'].forEach(id => {
+        const original = $(id);
+        const script = doc.createElement('script');
+        const nonce = original.nonce || original.getAttribute('nonce');
+        if (nonce) script.nonce = nonce;
+        script.textContent = original.textContent;
+        doc.body.appendChild(script);
+      });
+    }
+    win.focus();
+    showPopoutPanel(true);
+    clearInterval(popoutTimer);
+    popoutTimer = setInterval(() => {
+      if (popout && popout.closed) {
+        clearInterval(popoutTimer);
+        popout = null;
+        showPopoutPanel(false);
+      }
+    }, 800);
   }
 
   // ===========================================================================
@@ -1507,6 +1616,9 @@
   });
   el.cameraSelect.addEventListener('change', () => startCamera(el.cameraSelect.value));
   el.retryCamera.addEventListener('click', () => startCamera(store('camera')));
+  el.popoutBtn.addEventListener('click', openPopout);
+  el.popoutFromError.addEventListener('click', openPopout);
+  el.popoutUpload.addEventListener('click', () => el.fileInput.click());
   el.uploadBtn.addEventListener('click', () => el.fileInput.click());
   el.uploadInstead.addEventListener('click', () => el.fileInput.click());
   el.fileInput.addEventListener('change', () => {
@@ -1591,7 +1703,8 @@
     renderPages();
 
     loadOpenCv();
-    startCamera(store('camera'));
+    if (FRAMED && cameraBlockedByPolicy()) showPopoutPanel(false);
+    else startCamera(store('camera'));
 
     const [data, params] = await Promise.all([server('getInitialData').catch(() => null), urlParams()]);
     if (data) {
