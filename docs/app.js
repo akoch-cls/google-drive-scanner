@@ -5,11 +5,14 @@
   const CONFIG = {
     detectWidth: 480,     // frames are shrunk to this width for page detection
     tickMs: 100,          // analysis loop interval
-    autoFrames: 7,        // consecutive "ready" frames before auto-capture (~0.7 s)
+    autoFrames: 6,        // consecutive "ready" frames before auto-capture (~0.6 s)
     cooldownMs: 1500,     // minimum time between auto-captures
-    minSharpness: 12,     // below this the image is blurry no matter what
-    relSharpness: 0.72,   // fraction of the recent best focus that counts as sharp
-    steadyMotion: 3.5,    // frame-to-frame change below this = steady
+    minSharpness: 6,      // below this the image is blurry no matter what
+    relSharpness: 0.7,    // sharp = at least this fraction of the camera's typical sharpness
+    focusWindow: 25,      // frames (~2.5 s) used to learn the camera's typical sharpness
+    burstFrames: 5,       // frames grabbed per capture; the sharpest one is kept
+    steadyMotion: 6,      // frame-to-frame change below this = steady (hand-held paper trembles)
+    steadyQuad: 0.025,    // outline movement per frame below this = steady (fraction of frame)
     rearmMotion: 8,       // change above this = the page is being swapped
     maxOutputDim: 2200,   // longest edge of a finished page, in pixels
     maxSourceDim: 3200,   // uploaded photos are shrunk to this first
@@ -53,7 +56,7 @@
     'turnInCheck', 'saveError', 'saveSize', 'confirmSave', 'saveBusy', 'saveBusyText', 'resultModal',
     'resultIcon', 'resultTitle', 'resultBody', 'resultActions', 'teacherModal', 'tCourse', 'tCreate', 'tLink',
     'tTitle', 'tDesc', 'tDue', 'tPoints', 'tCreateBtn', 'tWorkList', 'tResult', 'tError', 'tBusy', 'helpModal',
-    'toast', 'toastText', 'toastAction', 'signInBtn', 'account', 'accountEmail', 'signOutBtn'
+    'toast', 'toastText', 'toastAction', 'edFingers', 'signInBtn', 'account', 'accountEmail', 'signOutBtn'
   ].forEach(id => { el[id] = $(id); });
 
   const state = {
@@ -62,14 +65,15 @@
     cvReady: false,
     autoEnabled: true,
     defaultFilter: 'enhanced',
+    removeFingers: true,
     capturing: false,
     loopTimer: null,
     prevGray: null,
     quad: null,          // detected page corners, normalised 0..1
     quadStable: false,
     quadMiss: 0,
-    focus: { raw: 0, peak: 0, rel: 0, sharp: false },
-    auto: { armed: true, count: 0, disturbed: 0, lastCapture: 0, justCaptured: 0, captured: 0 },
+    focus: { raw: 0, history: [], typical: 0, rel: 0, sharp: false },
+    auto: { armed: true, count: 0, disturbed: 0, lastCapture: 0, justCaptured: -Infinity, captured: 0 },
     openModals: [],
     dest: null,          // {id, name, path}
     recent: [],
@@ -344,24 +348,32 @@
     }
     updateQuad(found, sw, sh);
 
-    // Focus is measured at full resolution, on the middle of the page (or frame).
     const q = state.quad;
-    const cx = (q ? q.reduce((s, p) => s + p.x, 0) / 4 : 0.5) * vw;
-    const cy = (q ? q.reduce((s, p) => s + p.y, 0) / 4 : 0.5) * vh;
-    const fw = Math.min(400, Math.round(vw / 2.5)), fh = Math.min(300, Math.round(vh / 2.5));
-    const fx = Math.max(0, Math.min(vw - fw, Math.round(cx - fw / 2)));
-    const fy = Math.max(0, Math.min(vh - fh, Math.round(cy - fh / 2)));
-    if (focusCanvas.width !== fw || focusCanvas.height !== fh) {
-      focusCanvas.width = fw;
-      focusCanvas.height = fh;
+    const r = focusRegion(vw, vh);
+    if (focusCanvas.width !== r.w || focusCanvas.height !== r.h) {
+      focusCanvas.width = r.w;
+      focusCanvas.height = r.h;
     }
-    focusCtx.drawImage(v, fx, fy, fw, fh, 0, 0, fw, fh);
-    updateFocus(Vision.sharpness(focusCtx.getImageData(0, 0, fw, fh)));
+    focusCtx.drawImage(v, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
+    updateFocus(Vision.sharpness(focusCtx.getImageData(0, 0, r.w, r.h)));
 
     const steady = motion < CONFIG.steadyMotion && (!q || state.quadStable);
     updateAuto(!!q, steady, motion);
     drawOverlay(steady);
     updateStatus(steady);
+  }
+
+  /** Focus is measured at full resolution, on the middle of the page (or frame). */
+  function focusRegion(vw, vh) {
+    const q = state.quad;
+    const cx = (q ? q.reduce((s, p) => s + p.x, 0) / 4 : 0.5) * vw;
+    const cy = (q ? q.reduce((s, p) => s + p.y, 0) / 4 : 0.5) * vh;
+    const w = Math.min(400, Math.round(vw / 2.5)), h = Math.min(300, Math.round(vh / 2.5));
+    return {
+      x: Math.max(0, Math.min(vw - w, Math.round(cx - w / 2))),
+      y: Math.max(0, Math.min(vh - h, Math.round(cy - h / 2))),
+      w, h
+    };
   }
 
   function quadDistance(a, b) {
@@ -374,10 +386,10 @@
       const prev = state.quad;
       const d = prev ? quadDistance(prev, n) : Infinity;
       if (d < 0.08) {
-        state.quadStable = d < 0.012;
+        state.quadStable = d < CONFIG.steadyQuad;
         state.quad = prev.map((p, i) => ({ x: (p.x + n[i].x) / 2, y: (p.y + n[i].y) / 2 }));
       } else {
-        if (!prev) state.focus.peak = 0; // new page: forget the old focus reference
+        if (!prev) state.focus.history = []; // new page: relearn what "sharp" looks like
         state.quad = n;
         state.quadStable = false;
       }
@@ -390,12 +402,21 @@
     }
   }
 
+  /**
+   * Most laptop webcams are fixed-focus, so instead of waiting for a focus peak
+   * this compares each frame with what the camera typically manages (the 80th
+   * percentile of the last couple of seconds). Frames blurred by hand shake or
+   * by the camera refocusing fall well below that.
+   */
   function updateFocus(raw) {
     const f = state.focus;
     f.raw = raw;
-    f.peak = Math.max(f.peak * 0.97, raw);
-    const rel = f.peak > 0 ? raw / f.peak : 0;
-    f.rel = f.rel * 0.5 + rel * 0.5;
+    f.history.push(raw);
+    if (f.history.length > CONFIG.focusWindow) f.history.shift();
+    const sorted = f.history.slice().sort((a, b) => a - b);
+    f.typical = sorted[Math.floor((sorted.length - 1) * 0.8)] || raw;
+    const rel = f.typical > 0 ? raw / f.typical : 0;
+    f.rel = f.rel * 0.4 + rel * 0.6;
     f.sharp = f.rel >= CONFIG.relSharpness && raw >= CONFIG.minSharpness;
 
     const level = raw < CONFIG.minSharpness ? 0.3 * raw / CONFIG.minSharpness : Math.min(1, f.rel);
@@ -436,7 +457,7 @@
     } else if (!steady) {
       setStatus('Hold steady…', 'warn');
     } else if (!state.focus.sharp) {
-      setStatus('Focusing…', 'warn');
+      setStatus('Blurry — hold still a moment', 'warn');
     } else if (state.autoEnabled && !a.armed) {
       setStatus('Captured — show the next page', 'good');
     } else {
@@ -505,18 +526,51 @@
   // Capturing & importing pages
   // ===========================================================================
 
+  // Reused between captures: the sharpest frame of a burst, and a scratch frame.
+  let burstBest = null, burstScratch = null;
+
+  function nextVideoFrame(v) {
+    return new Promise(resolve => {
+      const timer = setTimeout(resolve, 100);
+      if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(() => { clearTimeout(timer); resolve(); });
+    });
+  }
+
+  /** Grabs a few frames in a row and keeps the sharpest, so hand shake doesn't blur the scan. */
+  async function grabSharpestFrame() {
+    const v = el.video;
+    const vw = v.videoWidth, vh = v.videoHeight;
+    if (!burstBest || burstBest.width !== vw || burstBest.height !== vh) {
+      burstBest = Vision.createCanvas(vw, vh);
+      burstScratch = Vision.createCanvas(vw, vh);
+    }
+    const r = focusRegion(vw, vh);
+    let bestScore = -1;
+    for (let i = 0; i < CONFIG.burstFrames; i++) {
+      if (i) await nextVideoFrame(v);
+      const ctx = Vision.ctx2d(burstScratch);
+      ctx.drawImage(v, 0, 0);
+      const score = Vision.sharpness(ctx.getImageData(r.x, r.y, r.w, r.h));
+      if (score > bestScore) {
+        bestScore = score;
+        [burstBest, burstScratch] = [burstScratch, burstBest];
+      }
+    }
+    return burstBest;
+  }
+
   async function capture() {
     const v = el.video;
     if (!v.videoWidth || state.capturing) return;
     state.capturing = true;
     try {
       const vw = v.videoWidth, vh = v.videoHeight;
-      const canvas = Vision.createCanvas(vw, vh);
-      canvas.getContext('2d').drawImage(v, 0, 0);
+      const quad = state.quad;
       el.flash.classList.remove('go');
       void el.flash.offsetWidth;
       el.flash.classList.add('go');
       shutterSound();
+      const canvas = await grabSharpestFrame();
 
       const a = state.auto;
       a.armed = false;
@@ -526,7 +580,7 @@
       a.captured = state.pages.length + 1;
       el.captureBtn.style.setProperty('--p', 0);
 
-      const corners = state.quad ? state.quad.map(p => ({ x: p.x * vw, y: p.y * vh })) : null;
+      const corners = quad ? quad.map(p => ({ x: p.x * vw, y: p.y * vh })) : null;
       const blob = await toBlob(canvas, 'image/jpeg', 0.92);
       await addPage(blob, vw, vh, corners);
     } catch (err) {
@@ -585,6 +639,7 @@
       corners: corners || Vision.fullFrame(w, h),
       rotation: 0,
       filter: state.defaultFilter,
+      removeFingers: state.removeFingers,
       isNew: true,
       version: 0
     };
@@ -594,7 +649,7 @@
     renderPages();
   }
 
-  /** Crop → straighten → rotate → clean up. Results are cached on the page. */
+  /** Crop → straighten → rotate → remove fingers → clean up. Results are cached on the page. */
   function processPage(page) {
     const version = ++page.version;
     page.pending = (async () => {
@@ -602,6 +657,7 @@
       try {
         let out = Vision.warp(bmp, page.corners, CONFIG.maxOutputDim);
         out = Vision.rotate(out, page.rotation);
+        page.fingersFound = page.removeFingers ? Vision.removeFingers(out) > 0 : false;
         Vision.applyFilter(out, page.filter);
         if (version !== page.version) return; // superseded by a newer edit
         page.outUrl = out.toDataURL('image/jpeg', page.filter === 'bw' ? 0.8 : CONFIG.jpegQuality);
@@ -747,6 +803,7 @@
     el.edEarlier.disabled = i <= 0;
     el.edLater.disabled = i >= state.pages.length - 1;
     el.filterSeg.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.filter === page.filter));
+    el.edFingers.checked = page.removeFingers;
     showPreview();
   }
 
@@ -900,6 +957,11 @@
       if (p.filter !== f) { p.filter = f; reprocess(p); }
     });
     toast('All pages now use the ' + el.filterSeg.querySelector('.active').textContent + ' look');
+  });
+  el.edFingers.addEventListener('change', () => {
+    editor.page.removeFingers = state.removeFingers = el.edFingers.checked;
+    store('removeFingers', state.removeFingers);
+    reprocess();
   });
   el.edRotL.addEventListener('click', () => { editor.page.rotation -= 90; reprocess(); });
   el.edRotR.addEventListener('click', () => { editor.page.rotation += 90; reprocess(); });
@@ -1655,6 +1717,7 @@
     if (typeof savedAuto === 'boolean') state.autoEnabled = el.autoToggle.checked = savedAuto;
     const savedFilter = store('filter');
     if (FILTERS.includes(savedFilter)) state.defaultFilter = savedFilter;
+    if (store('removeFingers') === false) state.removeFingers = false;
     state.dest = store('dest');
     el.captureBtn.disabled = true;
     renderPages();

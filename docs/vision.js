@@ -5,6 +5,7 @@
  *  - sharpness:   variance of the Laplacian, a standard focus measure
  *  - warp:        perspective correction (de-skew) of the page to a flat rectangle
  *  - applyFilter: shadow removal + contrast for a clean "scanned" look
+ *  - removeFingers: paints over fingers holding the page edge
  *
  * Everything except detectQuad is plain JavaScript, so the app keeps working
  * (with manual cropping) if OpenCV can't be loaded.
@@ -93,6 +94,227 @@ const Vision = (() => {
   }
 
   // -------------------------------------------------------------------------
+  // Fingers (skin detection)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Marks skin-coloured pixels. Colour is judged relative to the paper (the
+   * brightest 30% of the image), so warm or cool lighting that tints the whole
+   * page doesn't make the paper itself look like skin. Skin is redder and less
+   * blue than the paper under the same light, but not as saturated as
+   * orange/yellow highlighter.
+   */
+  function skinMask(imageData) {
+    const d = imageData.data, n = imageData.width * imageData.height;
+    const Y = new Uint8Array(n), Cb = new Float32Array(n), Cr = new Float32Array(n);
+    const hist = new Uint32Array(256);
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      const r = d[j], g = d[j + 1], b = d[j + 2];
+      const y = (r * 77 + g * 150 + b * 29) >> 8;
+      Y[i] = y;
+      hist[y]++;
+      Cb[i] = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+      Cr[i] = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+    }
+    let cut = 255;
+    for (let v = 255, acc = 0; v >= 0; v--) {
+      acc += hist[v];
+      if (acc >= n * 0.3) { cut = v; break; }
+    }
+    let refCb = 0, refCr = 0, m = 0;
+    for (let i = 0; i < n; i++) {
+      if (Y[i] >= cut) { refCb += Cb[i]; refCr += Cr[i]; m++; }
+    }
+    refCb /= m || 1;
+    refCr /= m || 1;
+
+    const mask = new Uint8Array(n);
+    let count = 0;
+    for (let i = 0; i < n; i++) {
+      if (Y[i] < 35) continue; // too dark to judge colour
+      const dcr = Cr[i] - refCr, dcb = Cb[i] - refCb;
+      if (dcr > 8 && dcb < 0 && dcr - dcb > 16 && -dcb < 1.6 * dcr + 4 && dcr * dcr + dcb * dcb < 3600) {
+        mask[i] = 1;
+        count++;
+      }
+    }
+    return { mask, count };
+  }
+
+  /** Binary max (r>0) or min (r<0) filter, separable, in place. */
+  function morph(mask, w, h, r) {
+    const grow = r > 0;
+    r = Math.abs(r);
+    const tmp = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let v = grow ? 0 : 1;
+        for (let k = Math.max(0, x - r); k <= Math.min(w - 1, x + r); k++) {
+          const m = mask[y * w + k];
+          if (grow ? m : !m) { v = grow ? 1 : 0; break; }
+        }
+        tmp[y * w + x] = v;
+      }
+    }
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let v = grow ? 0 : 1;
+        for (let k = Math.max(0, y - r); k <= Math.min(h - 1, y + r); k++) {
+          const m = tmp[k * w + x];
+          if (grow ? m : !m) { v = grow ? 1 : 0; break; }
+        }
+        mask[y * w + x] = v;
+      }
+    }
+  }
+
+  /**
+   * Finds fingers on a straightened page and paints over them with the
+   * surrounding paper colour. Only skin regions that reach in from the page
+   * edge count, so coloured marks in the middle of the page are left alone.
+   * Returns the fraction of the page that was painted over (0 if none).
+   */
+  function removeFingers(canvas) {
+    const W = canvas.width, H = canvas.height;
+    const s = Math.min(1, 600 / Math.max(W, H));
+    const w = Math.max(8, Math.round(W * s)), h = Math.max(8, Math.round(H * s));
+    const small = createCanvas(w, h);
+    const sctx = ctx2d(small);
+    sctx.imageSmoothingQuality = 'high';
+    sctx.drawImage(canvas, 0, 0, w, h);
+    const d = sctx.getImageData(0, 0, w, h).data;
+    const n = w * h;
+
+    const { mask } = skinMask({ data: d, width: w, height: h });
+    morph(mask, w, h, -1); // drop specks
+    morph(mask, w, h, 1);
+
+    // Keep connected skin regions that touch the border band.
+    const band = Math.max(2, Math.round(Math.min(w, h) * 0.04));
+    const minArea = n * 0.0015;
+    const keep = new Uint8Array(n);
+    const seen = new Uint8Array(n);
+    const queue = new Int32Array(n);
+    let kept = 0;
+    for (let start = 0; start < n; start++) {
+      if (!mask[start] || seen[start]) continue;
+      let head = 0, tail = 0, touches = false;
+      queue[tail++] = start;
+      seen[start] = 1;
+      while (head < tail) {
+        const i = queue[head++];
+        const x = i % w, y = (i / w) | 0;
+        if (x < band || y < band || x >= w - band || y >= h - band) touches = true;
+        if (x > 0 && mask[i - 1] && !seen[i - 1]) { seen[i - 1] = 1; queue[tail++] = i - 1; }
+        if (x < w - 1 && mask[i + 1] && !seen[i + 1]) { seen[i + 1] = 1; queue[tail++] = i + 1; }
+        if (y > 0 && mask[i - w] && !seen[i - w]) { seen[i - w] = 1; queue[tail++] = i - w; }
+        if (y < h - 1 && mask[i + w] && !seen[i + w]) { seen[i + w] = 1; queue[tail++] = i + w; }
+      }
+      if (touches && tail >= minArea) {
+        for (let k = 0; k < tail; k++) keep[queue[k]] = 1;
+        kept += tail;
+      }
+    }
+    // Nothing found, or so much "skin" that it's probably coloured paper.
+    if (!kept || kept > n * 0.35) return 0;
+    morph(keep, w, h, Math.max(2, Math.round(Math.min(w, h) * 0.008))); // cover the shadow fringe
+
+    // Paper colour field: average the unmasked pixels in 4×4 cells, then fill
+    // masked cells from their neighbours until every cell has a colour.
+    const g = 4, gw = Math.ceil(w / g), gh = Math.ceil(h / g), cells = gw * gh;
+    const sum = new Float32Array(cells * 3), cnt = new Float32Array(cells);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        if (keep[i]) continue;
+        const c = ((y / g) | 0) * gw + ((x / g) | 0);
+        sum[c * 3] += d[i * 4];
+        sum[c * 3 + 1] += d[i * 4 + 1];
+        sum[c * 3 + 2] += d[i * 4 + 2];
+        cnt[c]++;
+      }
+    }
+    let color = new Float32Array(cells * 3);
+    let known = new Uint8Array(cells);
+    for (let c = 0; c < cells; c++) {
+      if (cnt[c]) {
+        known[c] = 1;
+        color[c * 3] = sum[c * 3] / cnt[c];
+        color[c * 3 + 1] = sum[c * 3 + 1] / cnt[c];
+        color[c * 3 + 2] = sum[c * 3 + 2] / cnt[c];
+      }
+    }
+    for (let pass = 0; pass < gw + gh; pass++) {
+      const nextColor = color.slice(), nextKnown = known.slice();
+      let missing = 0;
+      for (let cy = 0; cy < gh; cy++) {
+        for (let cx = 0; cx < gw; cx++) {
+          const c = cy * gw + cx;
+          if (known[c]) continue;
+          let r = 0, gg = 0, b = 0, k = 0;
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+              const nx = cx + dx, ny = cy + dy;
+              if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue;
+              const nc = ny * gw + nx;
+              if (!known[nc]) continue;
+              r += color[nc * 3]; gg += color[nc * 3 + 1]; b += color[nc * 3 + 2]; k++;
+            }
+          }
+          if (k) {
+            nextColor[c * 3] = r / k; nextColor[c * 3 + 1] = gg / k; nextColor[c * 3 + 2] = b / k;
+            nextKnown[c] = 1;
+          } else {
+            missing++;
+          }
+        }
+      }
+      color = nextColor;
+      known = nextKnown;
+      if (!missing) break;
+    }
+
+    // Scale the colour field and the mask up to full size (bilinear = soft edges) and blend.
+    const field = createCanvas(gw, gh);
+    const fctx = ctx2d(field);
+    const fimg = fctx.createImageData(gw, gh);
+    for (let c = 0; c < cells; c++) {
+      fimg.data[c * 4] = color[c * 3];
+      fimg.data[c * 4 + 1] = color[c * 3 + 1];
+      fimg.data[c * 4 + 2] = color[c * 3 + 2];
+      fimg.data[c * 4 + 3] = 255;
+    }
+    fctx.putImageData(fimg, 0, 0);
+    const maskSmall = createCanvas(w, h);
+    const mctx = ctx2d(maskSmall);
+    const mimg = mctx.createImageData(w, h);
+    for (let i = 0; i < n; i++) mimg.data[i * 4 + 3] = keep[i] ? 255 : 0;
+    mctx.putImageData(mimg, 0, 0);
+
+    const big = createCanvas(W, H);
+    const bctx = ctx2d(big);
+    bctx.imageSmoothingQuality = 'high';
+    bctx.drawImage(field, 0, 0, W, H);
+    const fd = bctx.getImageData(0, 0, W, H).data;
+    bctx.clearRect(0, 0, W, H);
+    bctx.drawImage(maskSmall, 0, 0, W, H);
+    const md = bctx.getImageData(0, 0, W, H).data;
+
+    const ctx = ctx2d(canvas);
+    const out = ctx.getImageData(0, 0, W, H);
+    const od = out.data;
+    for (let i = 0; i < od.length; i += 4) {
+      const a = md[i + 3] / 255;
+      if (!a) continue;
+      od[i] += (fd[i] - od[i]) * a;
+      od[i + 1] += (fd[i + 1] - od[i + 1]) * a;
+      od[i + 2] += (fd[i + 2] - od[i + 2]) * a;
+    }
+    ctx.putImageData(out, 0, 0);
+    return kept / n;
+  }
+
+  // -------------------------------------------------------------------------
   // Page detection (OpenCV.js)
   // -------------------------------------------------------------------------
 
@@ -128,6 +350,13 @@ const Vision = (() => {
 
     try {
       cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+      // Treat skin as background: a thumb over the edge then only leaves a
+      // notch in the page outline, which the convex hull below fills back in.
+      const skin = skinMask(imageData);
+      if (skin.count < frameArea * 0.4) {
+        const g = gray.data;
+        for (let i = 0; i < frameArea; i++) if (skin.mask[i]) g[i] = 0;
+      }
       cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0);
       // "Auto Canny": thresholds based on the median brightness of the scene.
       const med = median(gray.data);
@@ -377,6 +606,6 @@ const Vision = (() => {
   return {
     createCanvas, ctx2d, orderCorners, fullFrame, polygonArea,
     toGray, meanAbsDiff, sharpness,
-    detectQuad, warp, rotate, applyFilter, quadSize
+    detectQuad, warp, rotate, applyFilter, quadSize, removeFingers
   };
 })();
