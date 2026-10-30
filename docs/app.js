@@ -1,4 +1,3 @@
-<script id="app-src">
 (() => {
   'use strict';
 
@@ -35,12 +34,9 @@
     chevron: '<svg viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg>'
   };
 
-  // Apps Script serves the page in a frame that isn't allowed to use the camera.
-  // In that case the whole app is copied into its own top-level window (the
-  // "pop-out"), which can use the camera, and server calls are relayed back
-  // through this frame, where google.script.run lives.
-  const HOST = window.__scannerHost || null;   // set when running in the pop-out
-  const FRAMED = !HOST && window.top !== window;
+  const api = ScannerAPI;
+  const MAX_RECENT_FOLDERS = 6;
+  const ROOT = { id: 'root', name: 'My Drive', path: 'My Drive' };
 
   const $ = id => document.getElementById(id);
   const el = {};
@@ -57,8 +53,7 @@
     'turnInCheck', 'saveError', 'saveSize', 'confirmSave', 'saveBusy', 'saveBusyText', 'resultModal',
     'resultIcon', 'resultTitle', 'resultBody', 'resultActions', 'teacherModal', 'tCourse', 'tCreate', 'tLink',
     'tTitle', 'tDesc', 'tDue', 'tPoints', 'tCreateBtn', 'tWorkList', 'tResult', 'tError', 'tBusy', 'helpModal',
-    'toast', 'toastText', 'toastAction', 'popoutPanel', 'popoutTitle', 'popoutText', 'popoutBtn',
-    'popoutUpload', 'popoutFromError'
+    'toast', 'toastText', 'toastAction', 'signInBtn', 'account', 'accountEmail', 'signOutBtn'
   ].forEach(id => { el[id] = $(id); });
 
   const state = {
@@ -76,12 +71,10 @@
     focus: { raw: 0, peak: 0, rel: 0, sharp: false },
     auto: { armed: true, count: 0, disturbed: 0, lastCapture: 0, justCaptured: 0, captured: 0 },
     openModals: [],
-    root: { id: null, name: 'My Drive' },
     dest: null,          // {id, name, path}
     recent: [],
     browse: null,
     saveTab: 'drive',
-    appUrl: '',
     cls: { courses: null, error: null, courseId: null, assignments: {}, selected: null, target: null },
     teacher: { courses: null, work: {} }
   };
@@ -95,39 +88,13 @@
   // Helpers
   // ===========================================================================
 
+  /** Calls a ScannerAPI function, always returning a promise. */
   function server(fn, ...args) {
-    if (HOST) {
-      // Arguments and results cross windows as JSON so each side gets plain objects of its own.
-      let call;
-      try {
-        call = HOST.call(fn, JSON.stringify(args));
-      } catch (err) {
-        return Promise.reject(new Error('The original Doc Scanner tab was closed. Open the web app again to save.'));
-      }
-      return Promise.resolve(call).then(
-        json => JSON.parse(json),
-        err => { throw new Error(String(err && err.message || err)); });
-    }
-    return new Promise((resolve, reject) => {
-      if (typeof google === 'undefined' || !google.script) {
-        reject(new Error('Not running inside Apps Script.'));
-        return;
-      }
-      google.script.run
-        .withSuccessHandler(resolve)
-        .withFailureHandler(err => reject(err instanceof Error ? err : new Error(String(err && err.message || err))))[fn](...args);
-    });
+    return Promise.resolve().then(() => api[fn](...args));
   }
 
   function urlParams() {
-    if (HOST) return Promise.resolve(JSON.parse(HOST.params || '{}'));
-    return new Promise(resolve => {
-      try {
-        google.script.url.getLocation(loc => resolve(loc.parameter || {}));
-      } catch (err) {
-        resolve(Object.fromEntries(new URLSearchParams(location.search)));
-      }
-    });
+    return Object.fromEntries(new URLSearchParams(location.search));
   }
 
   const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c =>
@@ -150,13 +117,16 @@
 
   function friendlyError(err) {
     const msg = String(err && err.message || err || 'Something went wrong.');
-    if (/Authorization is required|permission/i.test(msg) && /Classroom|course/i.test(msg)) {
+    if (/has not been used|is disabled|SERVICE_DISABLED/i.test(msg)) {
+      return 'The Google Drive or Classroom API is not turned on for this app yet. Whoever set it up needs to enable it in Google Cloud (see the README).';
+    }
+    if (/insufficient.*(scope|permission)|PERMISSION_DENIED/i.test(msg) && /Classroom|course/i.test(msg)) {
       return 'Google Classroom said no. Your school may need to allow this app, or you may not have access to that class.';
     }
-    if (/Classroom is not defined|has not been used|is disabled/i.test(msg)) {
-      return 'Google Classroom is not available for this account.';
+    if (/Failed to fetch|NetworkError/i.test(msg)) {
+      return "Couldn't reach Google. Check your internet connection and try again.";
     }
-    return msg.replace(/^Exception:\s*/, '');
+    return msg;
   }
 
   function formatDue(iso) {
@@ -335,96 +305,8 @@
     el.cameraErrorTitle.textContent = title;
     el.cameraErrorText.textContent = text;
     el.cameraError.classList.remove('hidden');
-    el.popoutFromError.classList.toggle('hidden', !FRAMED);
     el.captureBtn.disabled = true;
     setStatus('No camera', 'bad');
-  }
-
-  // ===========================================================================
-  // Pop-out scanner window (for when the frame can't use the camera)
-  // ===========================================================================
-
-  let popout = null;
-  let popoutTimer = null;
-
-  function cameraBlockedByPolicy() {
-    const policy = document.permissionsPolicy || document.featurePolicy;
-    try {
-      return !!policy && !policy.allowsFeature('camera');
-    } catch (err) {
-      return false;
-    }
-  }
-
-  function showPopoutPanel(open) {
-    stopCamera();
-    el.cameraError.classList.add('hidden');
-    el.popoutPanel.classList.remove('hidden');
-    el.captureBtn.disabled = true;
-    el.popoutTitle.textContent = open ? 'The scanner is open in its own window' : 'Open the scanner window';
-    el.popoutText.textContent = open
-      ? 'Scan and save from the scanner window. Keep this tab open: it connects the scanner to your Drive and Classroom.'
-      : "Google doesn't allow the camera on pages embedded in Apps Script, so the scanner opens in its own window. Everything still saves to your Drive and Classroom.";
-    el.popoutBtn.textContent = open ? 'Show scanner window' : 'Open scanner window';
-    setStatus(open ? 'Scanning in the other window' : 'Open the scanner window to use the camera', open ? 'good' : 'warn');
-  }
-
-  // Relays a server call from the pop-out. Runs in this frame, where google.script.run works.
-  function relay(fn, argsJson) {
-    return server(fn, ...JSON.parse(argsJson)).then(result => JSON.stringify(result === undefined ? null : result));
-  }
-
-  async function openPopout() {
-    if (popout && !popout.closed) {
-      popout.focus();
-      return;
-    }
-    const w = Math.min(1320, screen.availWidth - 40), h = Math.min(860, screen.availHeight - 40);
-    const win = window.open('', 'docScannerWindow',
-      'popup,width=' + w + ',height=' + h + ',left=' + Math.round((screen.availWidth - w) / 2) + ',top=20');
-    if (!win) {
-      toast('Your browser blocked the scanner window. Allow pop-ups for this site, then try again.', null, null, 7000);
-      return;
-    }
-    popout = win;
-    let existing = null;
-    try {
-      existing = win.__scannerHost;
-    } catch (err) {
-      // A window left over from a different origin: replace it.
-    }
-    if (existing) {
-      existing.call = relay; // this tab may have reloaded since the window opened
-    } else {
-      const params = await urlParams();
-      const doc = win.document;
-      doc.open();
-      doc.write('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">' +
-        '<meta name="viewport" content="width=device-width, initial-scale=1"><title>Doc Scanner</title></head><body></body></html>');
-      doc.close();
-      doc.head.appendChild(doc.importNode($('app-styles'), true));
-      doc.body.appendChild(doc.importNode($('app-markup').content, true));
-      win.__scannerHost = { call: relay, params: JSON.stringify(params) };
-      // Re-run the app's scripts inside the new window. Copy the nonce in case a CSP requires it.
-      ['vision-src', 'app-src'].forEach(id => {
-        const original = $(id);
-        const script = doc.createElement('script');
-        const nonce = original.nonce || original.getAttribute('nonce');
-        if (nonce) script.nonce = nonce;
-        script.textContent = original.textContent;
-        doc.body.appendChild(script);
-      });
-    }
-    win.focus();
-    showPopoutPanel(true);
-    clearInterval(popoutTimer);
-    popoutTimer = setInterval(() => {
-      if (popout && popout.closed) {
-        clearInterval(popoutTimer);
-        popout = null;
-        showPopoutPanel(false);
-      }
-    }, 800);
   }
 
   // ===========================================================================
@@ -1098,6 +980,18 @@
   el.saveModal.querySelectorAll('[data-tab]').forEach(b =>
     b.addEventListener('click', () => setSaveTab(b.dataset.tab)));
 
+  function rememberFolder(folder) {
+    const entry = { id: folder.id, name: folder.name, path: folder.path || folder.name };
+    state.recent = [entry].concat(state.recent.filter(f => f.id !== entry.id)).slice(0, MAX_RECENT_FOLDERS);
+    store('recentFolders', state.recent);
+  }
+
+  function forgetFolder(id) {
+    state.recent = state.recent.filter(f => f.id !== id);
+    store('recentFolders', state.recent);
+    if (state.dest && state.dest.id === id) setDest(null);
+  }
+
   function setDest(dest) {
     state.dest = dest;
     store('dest', dest);
@@ -1105,24 +999,24 @@
   }
 
   function renderDest() {
-    const d = state.dest || state.root;
+    const d = state.dest || ROOT;
     el.destName.textContent = d.name;
     el.destPath.textContent = d.path || '';
     el.destPath.classList.toggle('hidden', !d.path || d.path === d.name);
 
     const chips = state.recent.slice();
-    if (!chips.some(f => f.id === state.root.id) && state.root.id) chips.push({ ...state.root, path: 'My Drive' });
+    if (!chips.some(f => f.id === ROOT.id)) chips.push(ROOT);
     el.recentWrap.classList.toggle('hidden', chips.length < 2);
     el.recentChips.innerHTML = chips.map(f =>
       '<button type="button" data-id="' + esc(f.id) + '" title="' + esc(f.path || f.name) + '" class="' +
-      (f.id === d.id ? 'active' : '') + '">' + (f.id === state.root.id ? ICONS.drive : ICONS.folder) +
+      (f.id === d.id ? 'active' : '') + '">' + (f.id === ROOT.id ? ICONS.drive : ICONS.folder) +
       '<span>' + esc(f.name) + '</span></button>').join('');
   }
 
   el.recentChips.addEventListener('click', e => {
     const b = e.target.closest('button[data-id]');
     if (!b) return;
-    const f = state.recent.find(x => x.id === b.dataset.id) || { ...state.root, path: 'My Drive' };
+    const f = state.recent.find(x => x.id === b.dataset.id) || ROOT;
     setDest(f);
     el.browser.classList.add('hidden');
   });
@@ -1147,8 +1041,9 @@
       el.crumbs.innerHTML = data.path.map((p, i) =>
         (i ? '<span class="sep">›</span>' : '') + '<button type="button" data-id="' + esc(p.id) + '">' + esc(p.name) + '</button>').join('');
       el.crumbs.classList.remove('hidden');
-      el.useFolderBtn.textContent = 'Save in "' + data.name + '"';
-      el.useFolderBtn.disabled = false;
+      el.useFolderBtn.textContent = data.selectable === false ? 'Open a shared drive to save in it' : 'Save in "' + data.name + '"';
+      el.useFolderBtn.disabled = data.selectable === false;
+      el.newFolderBtn.disabled = data.selectable === false;
       el.folderList.innerHTML = data.children.length
         ? data.children.map(f => '<li><button type="button" data-id="' + esc(f.id) + '">' + ICONS.folder +
           '<span class="name">' + esc(f.name) + '</span>' + ICONS.chevron + '</button></li>').join('')
@@ -1194,7 +1089,7 @@
   });
   el.useFolderBtn.addEventListener('click', () => {
     const b = state.browse;
-    if (!b) return;
+    if (!b || b.selectable === false) return;
     setDest({ id: b.id, name: b.name, path: b.path.map(p => p.name).join(' › ') });
     el.browser.classList.add('hidden');
   });
@@ -1341,6 +1236,14 @@
     updateSaveButtonLabel();
     el.targetTitle.textContent = 'a Classroom assignment';
     el.targetBanner.classList.remove('hidden');
+    refreshTarget();
+  }
+
+  /** Fills in the banner once we're signed in and can ask Classroom. */
+  async function refreshTarget() {
+    const cls = state.cls;
+    if (!cls.target || !api.isSignedIn()) return;
+    const { courseId, assignmentId } = cls.target;
     try {
       await ensureCourses();
       await loadAssignments(courseId);
@@ -1385,11 +1288,13 @@
       if (bytes > CONFIG.maxUploadBytes) {
         throw new Error('This scan is too large to upload at once. Try the B&W look or save fewer pages.');
       }
-      el.saveBusyText.textContent = 'Uploading ' + pages.length + (pages.length === 1 ? ' page' : ' pages') + '…';
+      const uploading = 'Uploading ' + pages.length + (pages.length === 1 ? ' page' : ' pages');
+      const onProgress = f => { el.saveBusyText.textContent = uploading + '… ' + Math.round(f * 100) + '%'; };
+      el.saveBusyText.textContent = uploading + '…';
 
       if (state.saveTab === 'classroom') {
         const res = await server('submitToClassroom', {
-          name, pages,
+          name, pages, onProgress,
           courseId: assignment.courseId,
           courseWorkId: assignment.id,
           submissionId: assignment.submissionId,
@@ -1402,10 +1307,16 @@
         closeModal(el.saveModal);
         showClassroomResult(res, assignment);
       } else {
-        const dest = state.dest || state.root;
-        const res = await server('saveScan', { name, folderId: dest.id, pages });
-        state.recent = res.recentFolders || state.recent;
-        setDest(state.recent[0] || dest);
+        const dest = state.dest || ROOT;
+        let res;
+        try {
+          res = await server('saveScan', { name, folderId: dest.id, pages, onProgress });
+        } catch (err) {
+          if (err.code === 'folder_missing') forgetFolder(dest.id);
+          throw err;
+        }
+        rememberFolder(res.folder);
+        setDest(state.recent[0]);
         el.saveBusy.classList.add('hidden');
         closeModal(el.saveModal);
         showDriveResult(res);
@@ -1596,13 +1507,14 @@
     }
   }
 
-  el.teacherBtn.addEventListener('click', openTeacher);
+  el.teacherBtn.addEventListener('click', () => signedIn(openTeacher));
   el.teacherModal.querySelectorAll('[data-ttab]').forEach(b => b.addEventListener('click', () => setTeacherTab(b.dataset.ttab)));
   el.tCourse.addEventListener('change', () => {
     store('teachCourse', el.tCourse.value);
     if (!el.tLink.classList.contains('hidden')) loadTeacherWork();
   });
-  el.tCreateBtn.addEventListener('click', createAssignment);
+  // Creating assignments needs one extra Classroom permission, asked for only here.
+  el.tCreateBtn.addEventListener('click', () => signedIn(createAssignment, api.TEACHER_SCOPES));
 
   // ===========================================================================
   // Wiring
@@ -1616,16 +1528,21 @@
   });
   el.cameraSelect.addEventListener('change', () => startCamera(el.cameraSelect.value));
   el.retryCamera.addEventListener('click', () => startCamera(store('camera')));
-  el.popoutBtn.addEventListener('click', openPopout);
-  el.popoutFromError.addEventListener('click', openPopout);
-  el.popoutUpload.addEventListener('click', () => el.fileInput.click());
   el.uploadBtn.addEventListener('click', () => el.fileInput.click());
   el.uploadInstead.addEventListener('click', () => el.fileInput.click());
   el.fileInput.addEventListener('change', () => {
     importFiles(el.fileInput.files);
     el.fileInput.value = '';
   });
-  el.saveBtn.addEventListener('click', openSave);
+  el.saveBtn.addEventListener('click', () => signedIn(openSave));
+  el.signInBtn.addEventListener('click', () => signedIn(() => toast('Signed in as ' + api.getEmail())));
+  el.signOutBtn.addEventListener('click', () => {
+    api.signOut();
+    state.cls = { courses: null, error: null, courseId: null, assignments: {}, selected: null, target: state.cls.target };
+    state.teacher = { courses: null, work: {} };
+    el.teacherBtn.classList.add('hidden');
+    toast('Signed out');
+  });
   el.confirmSave.addEventListener('click', confirmSave);
   el.fileName.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); confirmSave(); } });
   el.clearBtn.addEventListener('click', () => {
@@ -1678,7 +1595,7 @@
       el.autoToggle.click();
     } else if (e.key === 's' || e.key === 'S') {
       e.preventDefault();
-      openSave();
+      signedIn(openSave);
     }
   });
 
@@ -1687,6 +1604,46 @@
       e.preventDefault();
       e.returnValue = '';
     }
+  });
+
+  // ===========================================================================
+  // Sign-in
+  // ===========================================================================
+
+  /**
+   * Runs `action` once signed in. Must be called straight from a click so the
+   * browser lets Google's sign-in pop-up open.
+   */
+  function signedIn(action, extraScopes) {
+    api.ensureSignedIn(extraScopes).then(action, err => {
+      if (err.code === 'not_configured') {
+        showResult({
+          kind: 'warn',
+          title: 'Setup needed',
+          body: '<p>' + esc(err.message) + '</p>',
+          actions: [{ label: 'OK', primary: true }]
+        });
+      } else {
+        toast(friendlyError(err), null, null, 6000);
+      }
+    });
+  }
+
+  function renderAccount(signedInNow) {
+    el.signInBtn.classList.toggle('hidden', signedInNow);
+    el.account.classList.toggle('hidden', !signedInNow);
+    el.accountEmail.textContent = api.getEmail();
+    el.accountEmail.title = api.getEmail();
+  }
+
+  let wasSignedIn = false;
+  api.onAuthChange(now => {
+    renderAccount(now);
+    if (now && !wasSignedIn) {
+      refreshTarget();
+      checkTeacher();
+    }
+    wasSignedIn = now;
   });
 
   // ===========================================================================
@@ -1703,20 +1660,16 @@
     renderPages();
 
     loadOpenCv();
-    if (FRAMED && cameraBlockedByPolicy()) showPopoutPanel(false);
-    else startCamera(store('camera'));
+    startCamera(store('camera'));
 
-    const [data, params] = await Promise.all([server('getInitialData').catch(() => null), urlParams()]);
-    if (data) {
-      state.root = data.root;
-      state.recent = data.recentFolders || [];
-      state.appUrl = data.appUrl;
-      if (!state.dest) state.dest = state.recent[0] || null;
-    }
+    state.recent = store('recentFolders') || [];
+    if (!state.dest) state.dest = state.recent[0] || null;
+    wasSignedIn = api.isSignedIn();
+    renderAccount(wasSignedIn);
+    const params = urlParams();
     if (params.course && params.assignment) setTarget(params.course, params.assignment);
-    checkTeacher();
+    if (wasSignedIn) checkTeacher();
   }
 
   init();
 })();
-</script>

@@ -1,4 +1,3 @@
-<script id="vision-src">
 /**
  * Vision: the image processing behind the scanner.
  *
@@ -381,4 +380,3 @@ const Vision = (() => {
     detectQuad, warp, rotate, applyFilter, quadSize
   };
 })();
-</script>
