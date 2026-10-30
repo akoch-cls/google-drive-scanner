@@ -4,5 +4,5 @@
  * they only work on the web addresses you list for them in Google Cloud.
  */
 window.SCANNER_CONFIG = {
-  clientId: 'YOUR_CLIENT_ID.apps.googleusercontent.com'
+  clientId: '369076520292-m8sf531d0knc0l3movv7pd3ruqqjhqg1.apps.googleusercontent.com'
 };
