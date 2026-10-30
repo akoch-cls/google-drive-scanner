@@ -12,8 +12,10 @@ browser, and people sign in with their own Google account, so scans go to their 
 - **Multi-page scanning.** Capture as many pages as you need. Drag thumbnails to reorder them, click one to edit it, delete with undo.
 - **Automatic edge detection.** The page outline is found live with OpenCV.js and drawn over the camera view.
 - **Perspective & skew correction.** Each page is warped flat into a rectangle. Rotate in 90° steps, or drag the corners yourself (a magnifier helps you place them exactly).
-- **Focus detection.** A live focus meter measures sharpness on the page itself. The outline turns green only when the page is found, held steady and in focus.
-- **Auto-capture.** When the outline is green for about 0.7 s the page is captured, with a flash and click. Show the next page and it captures again. It never captures the same page twice: it waits for the page to move first.
+- **Focus detection.** A live focus meter measures sharpness on the page itself. It compares each frame with what your camera normally manages, which suits laptop webcams (most are fixed-focus) and still rejects frames blurred by hand shake. The outline turns green when the page is found, steady and sharp.
+- **Sharpest-frame capture.** Each capture grabs a quick burst of frames and keeps the sharpest.
+- **Finger removal.** Holding the page by its edges is fine: fingers that reach in from the edge are detected by skin colour and painted over with the paper colour. Skin is also ignored when finding the page edges, so a thumb over the edge doesn't throw the outline off. It can be turned off per page in the editor.
+- **Auto-capture.** When the outline is green for about 0.6 s the page is captured, with a flash and click. Show the next page and it captures again. It never captures the same page twice: it waits for the page to move first.
 - **Clean-up looks.** *Enhanced* (shadow removal plus contrast, the default), *Original*, *Grayscale*, *B&W*. You can apply one look to every page.
 - **Quick folder picking.** Your last folder is preselected and recent folders are one click away. You can also browse My Drive and **shared drives**, search all of Drive, or create a folder without leaving the dialog.
 - **Google Classroom turn in.** Pick a class and assignment and the PDF is attached and turned in. See [Classroom: what works how](#classroom-what-works-how).
@@ -93,6 +95,7 @@ Scanner handles both cases:
 
 - Hold the page flat and fill most of the view. A **darker background** behind the page makes edge detection much more reliable.
 - Light from the front or side works best. *Enhanced* removes most shadows.
+- Hold the page by its side edges rather than covering the corners. Fingers along an edge are removed automatically, but a corner hidden under a thumb can't be found.
 - If the outline isn't found (low contrast, hands covering corners), press `Space` and drag the corners in the editor.
 
 ## Troubleshooting
@@ -111,7 +114,8 @@ Scanner handles both cases:
 | Step | File | Technique |
 | --- | --- | --- |
 | Page detection | `vision.js` → `detectQuad` | OpenCV.js: blur, auto-threshold Canny, dilate, contours, convex hull, 4-point polygon approximation. Runs on a 480-px frame about 10× per second. |
-| Focus | `vision.js` → `sharpness` | Variance of the Laplacian on a full-resolution crop at the page centre, compared with the recent best. Also needs an absolute minimum. |
+| Focus | `vision.js` → `sharpness` | Variance of the Laplacian on a full-resolution crop at the page centre, compared with the camera's typical value (80th percentile of the last ~2.5 s). Captures keep the sharpest of a 5-frame burst. |
+| Fingers | `vision.js` → `skinMask`, `removeFingers` | Skin colour judged relative to the paper's own tint (YCbCr). Skin regions touching the page border are filled from the surrounding paper colour; skin is treated as background during edge detection. |
 | Steadiness | `vision.js` → `meanAbsDiff` | Frame-to-frame change, plus how much the outline moves. |
 | De-skew | `vision.js` → `warp` | Projective (homography) warp with bilinear sampling. |
 | Clean-up | `vision.js` → `applyFilter` | Estimates the paper brightness (max-filter + blur on a shrunken copy), divides it out to remove shadows, then applies a levels curve. |
