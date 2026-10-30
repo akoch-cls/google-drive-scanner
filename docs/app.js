@@ -88,6 +88,10 @@
 
   const workCanvas = Vision.createCanvas(CONFIG.detectWidth, 270);
   const workCtx = Vision.ctx2d(workCanvas);
+  // Shrinking a 1080p frame to 480 px in one step skips pixels and makes the
+  // image grainy, which throws off page detection; halve it first.
+  const halfCanvas = Vision.createCanvas(960, 540);
+  const halfCtx = halfCanvas.getContext('2d');
   const focusCanvas = Vision.createCanvas(400, 300);
   const focusCtx = Vision.ctx2d(focusCanvas);
 
@@ -337,7 +341,17 @@
       workCanvas.width = sw;
       workCanvas.height = sh;
     }
-    workCtx.drawImage(v, 0, 0, sw, sh);
+    if (vw > sw * 2.5) {
+      const hw = sw * 2, hh = sh * 2;
+      if (halfCanvas.width !== hw || halfCanvas.height !== hh) { halfCanvas.width = hw; halfCanvas.height = hh; }
+      halfCtx.imageSmoothingQuality = 'high';
+      halfCtx.drawImage(v, 0, 0, hw, hh);
+      workCtx.imageSmoothingQuality = 'high';
+      workCtx.drawImage(halfCanvas, 0, 0, sw, sh);
+    } else {
+      workCtx.imageSmoothingQuality = 'high';
+      workCtx.drawImage(v, 0, 0, sw, sh);
+    }
     const frame = workCtx.getImageData(0, 0, sw, sh);
 
     const gray = Vision.toGray(frame);
@@ -475,7 +489,8 @@
     const img = ctx.createImageData(w, h);
     const d = img.data, src = frame.data;
     for (let i = 0, j = 0; i < w * h; i++, j += 4) {
-      if (info.skin && info.skin[i]) { d[j] = 255; d[j + 1] = 77; d[j + 2] = 77; }
+      if (info.ink && info.ink[i]) { d[j] = 255; d[j + 1] = 213; d[j + 2] = 0; }
+      else if (info.skin && info.skin[i]) { d[j] = 255; d[j + 1] = 77; d[j + 2] = 77; }
       else if (info.paper && info.paper[i]) { d[j] = d[j + 1] = d[j + 2] = 244; }
       else {
         const g = ((src[j] * 77 + src[j + 1] * 150 + src[j + 2] * 29) >> 8) * 0.4;
@@ -496,9 +511,13 @@
     if (info.best) outline(info.best.quad, info.best.touchesEdge ? '#ffb020' : '#00e676', 3);
 
     const f = state.focus, b = info.best;
+    const reasons = {};
+    (info.candidates || []).forEach(cand => { if (cand.reason) reasons[cand.reason] = (reasons[cand.reason] || 0) + 1; });
+    const rejected = Object.keys(reasons).map(r => r + ' ×' + reasons[r]).join(', ');
     const pct = v => (v == null ? '–' : Math.round(v * 100) + '%');
     el.debugText.textContent = [
-      'shapes: ' + (info.candidates || []).length + (b ? '   chosen: paper ' + pct(b.fill) + ', contrast ' + Math.round(b.contrast) : '   chosen: none'),
+      'shapes: ' + (info.candidates || []).length + (b ? '   chosen: paper ' + pct(b.fill) + ', writing ' + pct(b.inkFrac) : '   chosen: none'),
+      'rejected: ' + (rejected || '–'),
       'focus: ' + f.raw.toFixed(0) + ' / typical ' + f.typical.toFixed(0) + (mostlySharp() ? '  sharp' : '  blurry'),
       'motion: ' + motion.toFixed(1) + (steady ? '  steady' : '  moving') + (state.quadCut ? '   page cut off' : ''),
       'camera: ' + el.video.videoWidth + '×' + el.video.videoHeight

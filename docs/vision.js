@@ -467,14 +467,14 @@ const Vision = (() => {
    * its surroundings, large, and near the middle. Faces, bookshelves and
    * clothing fail the paper test; a window loses on size and position.
    */
-  function scoreQuad(pts, paper, Y, w, h) {
+  function scoreQuad(pts, paper, Y, ink, w, h) {
     const q = orderCorners(pts);
     const area = polygonArea(q);
     const margin = Math.sqrt(area) * 0.08;
     const xs = q.map(p => p.x), ys = q.map(p => p.y);
     const x0 = Math.max(0, Math.floor(Math.min(...xs) - margin)), x1 = Math.min(w - 1, Math.ceil(Math.max(...xs) + margin));
     const y0 = Math.max(0, Math.floor(Math.min(...ys) - margin)), y1 = Math.min(h - 1, Math.ceil(Math.max(...ys) + margin));
-    let nIn = 0, paperIn = 0, sumIn = 0, nOut = 0, sumOut = 0;
+    let nIn = 0, paperIn = 0, sumIn = 0, nOut = 0, sumOut = 0, inkIn = 0, clippedIn = 0;
     for (let y = y0; y <= y1; y += 2) {
       for (let x = x0; x <= x1; x += 2) {
         let inside = true;
@@ -483,12 +483,18 @@ const Vision = (() => {
           if ((b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x) < 0) inside = false;
         }
         const i = y * w + x;
-        if (inside) { nIn++; paperIn += paper[i]; sumIn += Y[i]; } else { nOut++; sumOut += Y[i]; }
+        if (inside) {
+          nIn++; paperIn += paper[i]; sumIn += Y[i]; inkIn += ink[i];
+          if (Y[i] >= 250) clippedIn++;
+        } else {
+          nOut++; sumOut += Y[i];
+        }
       }
     }
     if (!nIn) return { score: 0 };
     const fill = paperIn / nIn;
     const contrast = nOut ? sumIn / nIn - sumOut / nOut : 0;
+    const inkFrac = inkIn / nIn, clipped = clippedIn / nIn;
     const cx = xs.reduce((a, b) => a + b) / 4, cy = ys.reduce((a, b) => a + b) / 4;
     const centre = 1 - 0.5 * Math.min(1, Math.hypot(cx - w / 2, cy - h / 2) / (Math.hypot(w, h) / 2));
     const edge = Math.max(1.5, Math.min(w, h) * 0.004); // a cut-off page sits right on the border
@@ -496,9 +502,139 @@ const Vision = (() => {
     // The page is held up in the middle of the view; shapes centred near the
     // edges (windows, door frames, pictures on the wall) are background.
     const offCentre = Math.abs(cx - w / 2) > w * 0.3 || Math.abs(cy - h / 2) > h * 0.32;
-    if (fill < 0.55 || offCentre) return { score: 0, fill, contrast, touchesEdge, quad: q, offCentre };
-    const score = (area / (w * h)) * fill * fill * centre * (contrast > 10 ? 1 : 0.4) * (touchesEdge ? 0.6 : 1);
-    return { score, fill, contrast, touchesEdge, quad: q };
+    const info = { fill, contrast, inkFrac, clipped, touchesEdge, quad: q };
+    // A light fixture or glare is blown-out white with no writing; a wall,
+    // window or door has no writing either. (A brightly lit page can be
+    // blown-out white too, but its writing still shows.)
+    let reason = '';
+    if (offCentre) reason = 'off-centre';
+    else if (clipped > 0.15 && inkFrac < 0.03) reason = 'light/glare';
+    else if (inkFrac < 0.01) reason = 'no writing';
+    else if (fill < 0.7) reason = 'not paper-coloured';
+    if (reason) return Object.assign(info, { score: 0, reason });
+    // The page can be brighter or darker than what's behind it (exposure is often set for a ceiling light).
+    const score = (area / (w * h)) * fill * fill * centre * (Math.abs(contrast) > 10 ? 1 : 0.4) * (touchesEdge ? 0.6 : 1);
+    return Object.assign(info, { score });
+  }
+
+  const lumaOf = (d, j) => (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;
+  const cbOf = (d, j) => 128 - 0.168736 * d[j] - 0.331264 * d[j + 1] + 0.5 * d[j + 2];
+  const crOf = (d, j) => 128 + 0.5 * d[j] - 0.418688 * d[j + 1] - 0.081312 * d[j + 2];
+
+  /**
+   * Writing-first page finding, for rooms where the page isn't the brightest
+   * thing in view (e.g. the camera's exposure is set for a ceiling light).
+   *
+   *  1. Ink: thin dark strokes, found as (closing − image) on a colourless background.
+   *  2. Text zones: where ink is dense. These seed the search.
+   *  3. The paper's colour is sampled around the ink, wherever exposure puts it.
+   *  4. The region grows across smoothly-changing pixels of that colour
+   *     (in the ink-free closed image) and stops at sharp changes: the page edge.
+   *
+   * Returns the ink mask (used by scoring for every candidate) and candidates
+   * as { pts, mask } where mask is that page's own region.
+   */
+  function inkSeededCandidates(cv, src, imageData, skin, w, h, minArea, track) {
+    const n = w * h, d = imageData.data;
+    const k = Math.max(3, Math.round(w / 480 * 7)) | 1;
+    const kernel = track(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(k, k)));
+    const closed = track(new cv.Mat());
+    cv.morphologyEx(src, closed, cv.MORPH_CLOSE, kernel); // erases thin dark strokes, per channel
+    const cd = closed.data;
+
+    const Yc = new Uint8Array(n), Cbc = new Float32Array(n), Crc = new Float32Array(n);
+    const ink = new Uint8Array(n);
+    const density = track(cv.Mat.zeros(h, w, cv.CV_8UC1)); // zeros: only ink pixels are written below
+    const dd = density.data;
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      const yc = lumaOf(cd, j), y = lumaOf(d, j);
+      Yc[i] = yc; Cbc[i] = cbOf(cd, j); Crc[i] = crOf(cd, j);
+      const max = Math.max(cd[j], cd[j + 1], cd[j + 2]), min = Math.min(cd[j], cd[j + 1], cd[j + 2]);
+      const neutral = max > 40 && (max - min) / max < 0.25;
+      if (neutral && !skin[i] && yc - y > Math.max(10, yc * 0.1)) { ink[i] = 1; dd[i] = 255; }
+    }
+    // Dense ink = text zone.
+    const zk = Math.max(9, Math.round(w / 480 * 15)) | 1;
+    cv.blur(density, density, new cv.Size(zk, zk));
+    const zones = track(new cv.Mat());
+    cv.threshold(density, zones, 255 * 0.05, 255, cv.THRESH_BINARY);
+    const zoneK = track(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(zk, zk)));
+    cv.morphologyEx(zones, zones, cv.MORPH_CLOSE, zoneK);
+    const contours = track(new cv.MatVector());
+    const hier = track(new cv.Mat());
+    cv.findContours(zones, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    const zoneList = [];
+    for (let i = 0; i < contours.size(); i++) {
+      const c = contours.get(i);
+      const a = cv.contourArea(c);
+      if (a >= n * 0.025) zoneList.push({ i, a }); // a real block of text, not a lanyard or logo
+      c.delete();
+    }
+    zoneList.sort((a, b) => b.a - a.a);
+
+    const candidates = [];
+    for (const zone of zoneList.slice(0, 3)) {
+      const zm = track(cv.Mat.zeros(h, w, cv.CV_8UC1));
+      cv.drawContours(zm, contours, zone.i, new cv.Scalar(255), -1);
+      const zd = zm.data;
+      // Paper colour: median of the ink-free closed image inside the zone.
+      const ys = [], cbs = [], crs = [];
+      for (let i = 0; i < n; i += 3) if (zd[i] && !ink[i] && !skin[i]) { ys.push(Yc[i]); cbs.push(Cbc[i]); crs.push(Crc[i]); }
+      if (ys.length < 30) continue;
+      const med = arr => arr.sort((a, b) => a - b)[arr.length >> 1];
+      const py = med(ys), pcb = med(cbs), pcr = med(crs);
+      const tolY = Math.max(18, py * 0.22);
+
+      // Grow from the zone across smooth, paper-coloured pixels.
+      const region = new Uint8Array(n);
+      const queue = new Int32Array(n);
+      let head = 0, tail = 0;
+      for (let i = 0; i < n; i++) {
+        if (zd[i] && !skin[i] && Math.abs(Yc[i] - py) <= tolY) { region[i] = 1; queue[tail++] = i; }
+      }
+      while (head < tail) {
+        const i = queue[head++];
+        const x = i % w;
+        const around = [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i >= w ? i - w : -1, i + w < n ? i + w : -1];
+        for (const j of around) {
+          if (j < 0 || region[j] || skin[j]) continue;
+          if (Math.abs(Yc[j] - Yc[i]) > 4 || Math.abs(Cbc[j] - Cbc[i]) > 2.5 || Math.abs(Crc[j] - Crc[i]) > 2.5) continue;
+          if (Math.abs(Yc[j] - py) > tolY || Math.abs(Cbc[j] - pcb) > 7 || Math.abs(Crc[j] - pcr) > 7) continue;
+          region[j] = 1;
+          queue[tail++] = j;
+        }
+      }
+      if (tail < minArea) continue;
+
+      // Region outline → hull → 4 corners.
+      const rm = track(cv.Mat.zeros(h, w, cv.CV_8UC1));
+      const rd = rm.data;
+      for (let i = 0; i < n; i++) if (region[i]) rd[i] = 255;
+      cv.morphologyEx(rm, rm, cv.MORPH_CLOSE, zoneK);
+      // Cut thin leaks into similar-coloured background, then keep the page body.
+      const cutK = track(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(zk, zk)));
+      cv.morphologyEx(rm, rm, cv.MORPH_OPEN, cutK);
+      for (let i = 0; i < n; i++) region[i] = rd[i] ? 1 : 0;
+      const rc = track(new cv.MatVector());
+      const rh = track(new cv.Mat());
+      cv.findContours(rm, rc, rh, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      let bestI = -1, bestA = 0;
+      for (let i = 0; i < rc.size(); i++) {
+        const c = rc.get(i);
+        const a = cv.contourArea(c);
+        if (a > bestA) { bestA = a; bestI = i; }
+        c.delete();
+      }
+      if (bestI < 0) continue;
+      const c = rc.get(bestI);
+      const hull = new cv.Mat();
+      cv.convexHull(c, hull);
+      const pts = quadFromHull(cv, hull);
+      hull.delete();
+      c.delete();
+      if (pts) candidates.push({ pts, mask: region });
+    }
+    return { ink, candidates };
   }
 
   /**
@@ -518,11 +654,12 @@ const Vision = (() => {
     const noSkin = new Uint8Array(frameArea);
     const paper = paperMask(imageData, skinUsable ? skin.mask : noSkin);
     const candidates = [];
-    const consider = pts => {
+    const consider = (pts, mask) => {
       if (!pts) return;
       const area = polygonArea(pts);
-      if (area >= frameArea * minAreaRatio && area < frameArea * 0.985 && looksLikePage(pts)) candidates.push(pts);
+      if (area >= frameArea * minAreaRatio && area < frameArea * 0.985 && looksLikePage(pts)) candidates.push({ pts, mask });
     };
+    let ink = new Uint8Array(frameArea);
 
     const mats = [];
     const track = m => { mats.push(m); return m; };
@@ -559,8 +696,13 @@ const Vision = (() => {
         }
       }
 
-      // 2. Edge outlines (good on low-contrast backgrounds where colour alone isn't enough).
+      // 2. Pages found from their writing (works whatever the exposure).
       const src = track(cv.matFromImageData(imageData));
+      const seeded = inkSeededCandidates(cv, src, imageData, skinUsable ? skin.mask : noSkin, w, h, frameArea * minAreaRatio, track);
+      ink = seeded.ink;
+      seeded.candidates.forEach(c => consider(c.pts, c.mask));
+
+      // 3. Edge outlines (good on low-contrast backgrounds where colour alone isn't enough).
       const gray = track(new cv.Mat());
       const edges = track(new cv.Mat());
       cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
@@ -591,7 +733,7 @@ const Vision = (() => {
     }
 
     let best = null;
-    const scored = candidates.map(pts => scoreQuad(pts, paper.strict, paper.Y, w, h));
+    const scored = candidates.map(c => scoreQuad(c.pts, c.mask || paper.strict, paper.Y, ink, w, h));
     for (const s of scored) {
       if (s.score > 0 && (!best || s.score > best.score)) best = s;
     }
@@ -600,7 +742,9 @@ const Vision = (() => {
       debug.height = h;
       debug.skin = skinUsable ? skin.mask : noSkin;
       debug.paper = paper.strict;
+      debug.ink = ink;
       debug.candidates = scored.filter(c => c.quad);
+      debug.regions = candidates.map((c, i) => (scored[i].quad ? c.mask || null : undefined)).filter(m => m !== undefined);
       debug.best = best;
     }
     if (!best) return null;
