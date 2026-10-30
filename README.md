@@ -10,7 +10,7 @@ browser, and people sign in with their own Google account, so scans go to their 
 ## Features
 
 - **Multi-page scanning.** Capture as many pages as you need. Drag thumbnails to reorder them, click one to edit it, delete with undo.
-- **Automatic edge detection.** The page outline is found live with OpenCV.js and drawn over the camera view.
+- **Automatic edge detection.** The page outline is found live and drawn over the camera view. It looks for the paper itself (a bright, nearly colourless region that isn't skin) as well as for outlines, so faces, bookshelves and windows behind you aren't mistaken for the page. If part of the page is out of view, it asks you to move it back instead of guessing.
 - **Perspective & skew correction.** Each page is warped flat into a rectangle. Rotate in 90° steps, or drag the corners yourself (a magnifier helps you place them exactly).
 - **Focus detection.** A live focus meter measures sharpness on the page itself. It compares each frame with what your camera normally manages, which suits laptop webcams (most are fixed-focus) and still rejects frames blurred by hand shake. The outline turns green when the page is found, steady and sharp.
 - **Sharpest-frame capture.** Each capture grabs a quick burst of frames and keeps the sharpest.
@@ -107,15 +107,18 @@ Scanner handles both cases:
 | Sign-in pop-up doesn't appear | Allow pop-ups for the site. |
 | "API is not turned on" | Enable the Drive API and Classroom API in the Google Cloud project. |
 | Camera blocked | Click the camera icon in the address bar and allow it, then **Try again**. |
+| On a Mac, the picture keeps panning/zooming to follow your face and the page never holds still | Turn off **Center Stage**: while the camera is on, click the green camera icon in the menu bar (or Control Center → Video Effects). Turn off **Portrait** too. Web pages can't change this setting. |
+| It outlines the wrong thing, or won't capture the page | Press **D** (or open the site with `?debug` on the end of the address) to see what the scanner sees: paper-coloured areas in white, skin in red, every shape it considered in yellow, and its choice in green. **Save camera frame** downloads the current picture, which is the most useful thing to include in a problem report. |
+| "Move the page back so all four corners are in view" | Part of the page is outside the picture. Move it further from the camera, or lower the screen a little. |
 | Top bar says **Manual crop only** | OpenCV.js couldn't load from `docs.opencv.org` or `cdn.jsdelivr.net` (often a web filter). Allow those hosts, or put `opencv.js` in `docs/` and add `'opencv.js'` to `CV_URLS` in `docs/app.js`. |
 
 ## How it works
 
 | Step | File | Technique |
 | --- | --- | --- |
-| Page detection | `vision.js` → `detectQuad` | OpenCV.js: blur, auto-threshold Canny, dilate, contours, convex hull, 4-point polygon approximation. Runs on a 480-px frame about 10× per second. |
+| Page detection | `vision.js` → `detectQuad` | Candidates from paper-coloured regions (Otsu brightness split, low saturation, not skin, morphological close/open) and from Canny outlines, each reduced to 4 corners via convex hull + polygon approximation. Each is scored by how paper-coloured its inside is, its contrast with the surroundings, size and closeness to the centre (`scoreQuad`). Runs with OpenCV.js on a 480-px frame about 10× per second. |
 | Focus | `vision.js` → `sharpness` | Variance of the Laplacian on a full-resolution crop at the page centre, compared with the camera's typical value (80th percentile of the last ~2.5 s). Captures keep the sharpest of a 5-frame burst. |
-| Fingers | `vision.js` → `skinMask`, `removeFingers` | Skin colour judged relative to the paper's own tint (YCbCr). Skin regions touching the page border are filled from the surrounding paper colour; skin is treated as background during edge detection. |
+| Fingers | `vision.js` → `skinMask`, `removeFingers` | Skin colour judged relative to the paper's own tint (YCbCr). Skin regions touching the page border, plus the darker rim and shadow next to them, are filled from the surrounding paper colour; skin is ignored during edge detection. |
 | Steadiness | `vision.js` → `meanAbsDiff` | Frame-to-frame change, plus how much the outline moves. |
 | De-skew | `vision.js` → `warp` | Projective (homography) warp with bilinear sampling. |
 | Clean-up | `vision.js` → `applyFilter` | Estimates the paper brightness (max-filter + blur on a shrunken copy), divides it out to remove shadows, then applies a levels curve. |

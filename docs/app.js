@@ -56,7 +56,8 @@
     'turnInCheck', 'saveError', 'saveSize', 'confirmSave', 'saveBusy', 'saveBusyText', 'resultModal',
     'resultIcon', 'resultTitle', 'resultBody', 'resultActions', 'teacherModal', 'tCourse', 'tCreate', 'tLink',
     'tTitle', 'tDesc', 'tDue', 'tPoints', 'tCreateBtn', 'tWorkList', 'tResult', 'tError', 'tBusy', 'helpModal',
-    'toast', 'toastText', 'toastAction', 'edFingers', 'signInBtn', 'account', 'accountEmail', 'signOutBtn'
+    'toast', 'toastText', 'toastAction', 'edFingers', 'macTip', 'macTipClose',
+    'debugPanel', 'debugClose', 'debugCanvas', 'debugText', 'debugSave', 'signInBtn', 'account', 'accountEmail', 'signOutBtn'
   ].forEach(id => { el[id] = $(id); });
 
   const state = {
@@ -66,13 +67,15 @@
     autoEnabled: true,
     defaultFilter: 'enhanced',
     removeFingers: true,
+    debug: false,        // troubleshooting view (press D, or open with ?debug)
     capturing: false,
     loopTimer: null,
     prevGray: null,
     quad: null,          // detected page corners, normalised 0..1
     quadStable: false,
     quadMiss: 0,
-    focus: { raw: 0, history: [], typical: 0, rel: 0, sharp: false },
+    quadCut: false,      // the page runs off the edge of the frame
+    focus: { raw: 0, history: [], typical: 0, rel: 0, sharp: false, log: [] },
     auto: { armed: true, count: 0, disturbed: 0, lastCapture: 0, justCaptured: -Infinity, captured: 0 },
     openModals: [],
     dest: null,          // {id, name, path}
@@ -343,10 +346,12 @@
     state.prevGray = gray;
 
     let found = null;
+    const debugInfo = state.debug ? {} : null;
     if (state.cvReady) {
-      try { found = Vision.detectQuad(frame); } catch (err) { console.warn('detect failed', err); }
+      try { found = Vision.detectQuad(frame, undefined, debugInfo); } catch (err) { console.warn('detect failed', err); }
     }
     updateQuad(found, sw, sh);
+    if (found) state.quadCut = !!found.touchesEdge;
 
     const q = state.quad;
     const r = focusRegion(vw, vh);
@@ -361,6 +366,7 @@
     updateAuto(!!q, steady, motion);
     drawOverlay(steady);
     updateStatus(steady);
+    if (debugInfo) drawDebug(frame, debugInfo, motion, steady);
   }
 
   /** Focus is measured at full resolution, on the middle of the page (or frame). */
@@ -418,10 +424,18 @@
     const rel = f.typical > 0 ? raw / f.typical : 0;
     f.rel = f.rel * 0.4 + rel * 0.6;
     f.sharp = f.rel >= CONFIG.relSharpness && raw >= CONFIG.minSharpness;
+    f.log.push(f.sharp);
+    if (f.log.length > CONFIG.autoFrames) f.log.shift();
 
     const level = raw < CONFIG.minSharpness ? 0.3 * raw / CONFIG.minSharpness : Math.min(1, f.rel);
     el.focusFill.style.width = Math.round(level * 100) + '%';
     el.focusFill.style.background = f.sharp ? '#34d058' : level > 0.5 ? '#ffb020' : '#ff5b4f';
+  }
+
+  /** True when at least half of the recent frames were sharp. */
+  function mostlySharp() {
+    const log = state.focus.log;
+    return log.length > 0 && log.filter(Boolean).length * 2 >= Math.min(log.length, CONFIG.autoFrames);
   }
 
   function updateAuto(hasPage, steady, motion) {
@@ -435,12 +449,82 @@
         a.disturbed = 0;
       }
     }
-    const ready = hasPage && steady && state.focus.sharp;
+    // Every frame doesn't have to be sharp: the capture burst keeps the sharpest one.
+    const ready = hasPage && !state.quadCut && steady && mostlySharp();
     a.count = ready ? a.count + 1 : 0;
     const progress = state.autoEnabled && a.armed ? Math.min(1, a.count / CONFIG.autoFrames) : 0;
     el.captureBtn.style.setProperty('--p', progress.toFixed(2));
     if (state.autoEnabled && a.armed && a.count >= CONFIG.autoFrames) capture();
   }
+
+  // ===========================================================================
+  // Troubleshooting view
+  // ===========================================================================
+
+  function setDebug(on) {
+    state.debug = on;
+    el.debugPanel.classList.toggle('hidden', !on);
+  }
+
+  /** Shows the detector's view: paper-coloured pixels, skin, every shape it considered, and the numbers behind its decisions. */
+  function drawDebug(frame, info, motion, steady) {
+    const c = el.debugCanvas;
+    const w = frame.width, h = frame.height;
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+    const ctx = c.getContext('2d');
+    const img = ctx.createImageData(w, h);
+    const d = img.data, src = frame.data;
+    for (let i = 0, j = 0; i < w * h; i++, j += 4) {
+      if (info.skin && info.skin[i]) { d[j] = 255; d[j + 1] = 77; d[j + 2] = 77; }
+      else if (info.paper && info.paper[i]) { d[j] = d[j + 1] = d[j + 2] = 244; }
+      else {
+        const g = ((src[j] * 77 + src[j + 1] * 150 + src[j + 2] * 29) >> 8) * 0.4;
+        d[j] = d[j + 1] = d[j + 2] = g;
+      }
+      d[j + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+    const outline = (q, color, width) => {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.beginPath();
+      q.forEach((p, k) => (k ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+      ctx.closePath();
+      ctx.stroke();
+    };
+    (info.candidates || []).forEach(cand => outline(cand.quad, cand.score > 0 ? '#ffd54f' : 'rgba(255,213,79,.35)', 1.5));
+    if (info.best) outline(info.best.quad, info.best.touchesEdge ? '#ffb020' : '#00e676', 3);
+
+    const f = state.focus, b = info.best;
+    const pct = v => (v == null ? '–' : Math.round(v * 100) + '%');
+    el.debugText.textContent = [
+      'shapes: ' + (info.candidates || []).length + (b ? '   chosen: paper ' + pct(b.fill) + ', contrast ' + Math.round(b.contrast) : '   chosen: none'),
+      'focus: ' + f.raw.toFixed(0) + ' / typical ' + f.typical.toFixed(0) + (mostlySharp() ? '  sharp' : '  blurry'),
+      'motion: ' + motion.toFixed(1) + (steady ? '  steady' : '  moving') + (state.quadCut ? '   page cut off' : ''),
+      'camera: ' + el.video.videoWidth + '×' + el.video.videoHeight
+    ].join('\n');
+  }
+
+  /** Downloads the current full-resolution camera frame, to send along with a problem report. */
+  function saveDebugFrame() {
+    const v = el.video;
+    if (!v.videoWidth) return;
+    const c = Vision.createCanvas(v.videoWidth, v.videoHeight);
+    c.getContext('2d').drawImage(v, 0, 0);
+    c.toBlob(blob => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'scanner-frame-' + new Date().toISOString().replace(/[:.]/g, '-') + '.jpg';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      toast('Saved ' + a.download);
+    }, 'image/jpeg', 0.92);
+  }
+
+  el.debugClose.addEventListener('click', () => setDebug(false));
+  el.debugSave.addEventListener('click', saveDebugFrame);
 
   function setStatus(text, kind) {
     if (el.statusText.textContent !== text) el.statusText.textContent = text;
@@ -454,9 +538,11 @@
       setStatus('Page ' + a.captured + ' captured' + (state.autoEnabled ? ' — show the next page' : ''), 'good');
     } else if (!state.quad) {
       setStatus(state.cvReady ? 'Hold a page up to the camera' : 'Frame the page, then capture', state.cvReady ? '' : 'warn');
+    } else if (state.quadCut) {
+      setStatus('Move the page back so all four corners are in view', 'warn');
     } else if (!steady) {
       setStatus('Hold steady…', 'warn');
-    } else if (!state.focus.sharp) {
+    } else if (!mostlySharp()) {
       setStatus('Blurry — hold still a moment', 'warn');
     } else if (state.autoEnabled && !a.armed) {
       setStatus('Captured — show the next page', 'good');
@@ -501,9 +587,9 @@
       return;
     }
 
-    const ready = steady && state.focus.sharp;
+    const ready = !state.quadCut && steady && mostlySharp();
     const pts = state.quad.map(p => ({ x: r.x + p.x * r.w, y: r.y + p.y * r.h }));
-    const color = ready ? '52,208,88' : '138,180,248';
+    const color = ready ? '52,208,88' : state.quadCut ? '255,176,32' : '138,180,248';
     ctx.beginPath();
     pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
     ctx.closePath();
@@ -1653,6 +1739,8 @@
     if (e.code === 'Space') {
       e.preventDefault();
       if (!el.captureBtn.disabled) capture();
+    } else if (e.key === 'd' || e.key === 'D') {
+      setDebug(!state.debug);
     } else if (e.key === 'a' || e.key === 'A') {
       el.autoToggle.click();
     } else if (e.key === 's' || e.key === 'S') {
@@ -1666,6 +1754,21 @@
       e.preventDefault();
       e.returnValue = '';
     }
+  });
+
+  /**
+   * Macs (and iPads) have Center Stage, which pans and zooms to follow your
+   * face. That moves the whole picture, so the page never looks steady.
+   * Web pages can't switch it off, so explain how.
+   */
+  function showMacTip() {
+    const apple = /Macintosh|Mac OS X|iPad/.test(navigator.userAgent);
+    if (!apple || store('macTipDismissed')) return;
+    el.macTip.classList.remove('hidden');
+  }
+  el.macTipClose.addEventListener('click', () => {
+    el.macTip.classList.add('hidden');
+    store('macTipDismissed', true);
   });
 
   // ===========================================================================
@@ -1724,12 +1827,14 @@
 
     loadOpenCv();
     startCamera(store('camera'));
+    showMacTip();
 
     state.recent = store('recentFolders') || [];
     if (!state.dest) state.dest = state.recent[0] || null;
     wasSignedIn = api.isSignedIn();
     renderAccount(wasSignedIn);
     const params = urlParams();
+    if ('debug' in params) setDebug(true);
     if (params.course && params.assignment) setTarget(params.course, params.assignment);
     if (wasSignedIn) checkTeacher();
   }

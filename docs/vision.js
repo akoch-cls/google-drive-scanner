@@ -127,6 +127,11 @@ const Vision = (() => {
     }
     refCb /= m || 1;
     refCr /= m || 1;
+    // Cameras white-balance, so paper is close to neutral. Only allow a small
+    // tint: if a brightly lit face is the brightest thing in view, it must not
+    // become the reference (it would then stop counting as skin).
+    refCb = Math.min(134, Math.max(118, refCb));
+    refCr = Math.min(136, Math.max(122, refCr));
 
     const mask = new Uint8Array(n);
     let count = 0;
@@ -169,6 +174,33 @@ const Vision = (() => {
   }
 
   /**
+   * Extends a finger mask into the darker rim and shadow around it: pixels
+   * next to the mask that are clearly darker than the paper, up to `limit`
+   * pixels away. Skin colour alone misses these.
+   */
+  function growIntoShadow(mask, lum, paperLevel, w, h, limit) {
+    const n = w * h;
+    const darker = paperLevel * 0.85;
+    const dist = new Uint16Array(n).fill(65535);
+    const queue = new Int32Array(n);
+    let head = 0, tail = 0;
+    for (let i = 0; i < n; i++) if (mask[i]) { dist[i] = 0; queue[tail++] = i; }
+    while (head < tail) {
+      const i = queue[head++];
+      const next = dist[i] + 1;
+      if (next > limit) continue;
+      const x = i % w;
+      const around = [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w];
+      for (const j of around) {
+        if (j < 0 || j >= n || mask[j] || lum[j] >= darker) continue;
+        mask[j] = 1;
+        dist[j] = next;
+        queue[tail++] = j;
+      }
+    }
+  }
+
+  /**
    * Finds fingers on a straightened page and paints over them with the
    * surrounding paper colour. Only skin regions that reach in from the page
    * edge count, so coloured marks in the middle of the page are left alone.
@@ -186,12 +218,22 @@ const Vision = (() => {
     const n = w * h;
 
     const { mask } = skinMask({ data: d, width: w, height: h });
+    const lum = new Uint8Array(n), hist = new Uint32Array(256);
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      lum[i] = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;
+      hist[lum[i]]++;
+    }
+    let paperLevel = 255; // 70th percentile brightness = paper
+    for (let v = 0, acc = 0; v < 256; v++) {
+      acc += hist[v];
+      if (acc >= n * 0.7) { paperLevel = v; break; }
+    }
     morph(mask, w, h, -1); // drop specks
     morph(mask, w, h, 1);
 
     // Keep connected skin regions that touch the border band.
     const band = Math.max(2, Math.round(Math.min(w, h) * 0.04));
-    const minArea = n * 0.0015;
+    const minArea = n * 0.0004;
     const keep = new Uint8Array(n);
     const seen = new Uint8Array(n);
     const queue = new Int32Array(n);
@@ -217,16 +259,17 @@ const Vision = (() => {
     }
     // Nothing found, or so much "skin" that it's probably coloured paper.
     if (!kept || kept > n * 0.35) return 0;
-    morph(keep, w, h, Math.max(2, Math.round(Math.min(w, h) * 0.008))); // cover the shadow fringe
+    growIntoShadow(keep, lum, paperLevel, w, h, Math.max(3, Math.round(Math.min(w, h) * 0.03)));
+    morph(keep, w, h, Math.max(2, Math.round(Math.min(w, h) * 0.008)));
 
-    // Paper colour field: average the unmasked pixels in 4×4 cells, then fill
-    // masked cells from their neighbours until every cell has a colour.
+    // Paper colour field: average the unmasked paper pixels (not ink, not
+    // shadow) in 4×4 cells, then fill the other cells from their neighbours.
     const g = 4, gw = Math.ceil(w / g), gh = Math.ceil(h / g), cells = gw * gh;
     const sum = new Float32Array(cells * 3), cnt = new Float32Array(cells);
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
         const i = y * w + x;
-        if (keep[i]) continue;
+        if (keep[i] || lum[i] < paperLevel * 0.88) continue;
         const c = ((y / g) | 0) * gw + ((x / g) | 0);
         sum[c * 3] += d[i * 4];
         sum[c * 3 + 1] += d[i * 4 + 1];
@@ -330,73 +373,240 @@ const Vision = (() => {
     return 128;
   }
 
+  function otsuThreshold(hist, total) {
+    let sum = 0;
+    for (let v = 0; v < 256; v++) sum += v * hist[v];
+    let sumB = 0, wB = 0, best = 0, t = 128;
+    for (let v = 0; v < 256; v++) {
+      wB += hist[v];
+      if (!wB) continue;
+      const wF = total - wB;
+      if (!wF) break;
+      sumB += v * hist[v];
+      const diff = sumB / wB - (sum - sumB) / wF;
+      const between = wB * wF * diff * diff;
+      if (between > best) { best = between; t = v; }
+    }
+    return t;
+  }
+
   /**
-   * Finds the largest 4-sided shape in the image that looks like a page.
-   * Returns 4 ordered corners in the image's pixel coordinates, or null.
+   * Marks pixels that look like paper: bright (above the Otsu split between
+   * light and dark), nearly colourless, and not skin. Saturation is allowed to
+   * rise with the scene's own tint, so paper under warm light still counts.
    */
-  function detectQuad(imageData, minAreaRatio = 0.12) {
+  function paperMask(imageData, skin) {
+    const d = imageData.data, n = imageData.width * imageData.height;
+    const Y = new Uint8Array(n), sat = new Float32Array(n), hist = new Uint32Array(256);
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      const r = d[j], g = d[j + 1], b = d[j + 2];
+      const y = (r * 77 + g * 150 + b * 29) >> 8;
+      const max = Math.max(r, g, b), min = Math.min(r, g, b);
+      Y[i] = y;
+      sat[i] = max ? (max - min) / max : 0;
+      hist[y]++;
+    }
+    const t = Math.max(80, otsuThreshold(hist, n));
+    // Typical saturation of the brightest 10% of the scene = the light's tint.
+    let cut = 255;
+    for (let v = 255, acc = 0; v >= 0; v--) {
+      acc += hist[v];
+      if (acc >= n * 0.1) { cut = v; break; }
+    }
+    const bright = [];
+    for (let i = 0; i < n; i += 7) if (Y[i] >= cut && !skin[i]) bright.push(sat[i]);
+    bright.sort((a, b) => a - b);
+    const tint = bright.length ? bright[bright.length >> 1] : 0;
+    const maxSat = Math.min(0.4, Math.max(0.25, tint + 0.12));
+
+    const mask = new Uint8Array(n);
+    for (let i = 0; i < n; i++) mask[i] = Y[i] >= t && sat[i] < maxSat && !skin[i] ? 1 : 0;
+
+    // A light wall can pass as paper too. If the bright pixels split clearly
+    // into two levels, the brighter level is the paper: build a strict mask too.
+    const upper = new Uint32Array(256);
+    let upperTotal = 0;
+    for (let v = t; v < 256; v++) { upper[v] = hist[v]; upperTotal += hist[v]; }
+    let strict = mask;
+    if (upperTotal) {
+      const t2 = otsuThreshold(upper, upperTotal);
+      let lo = 0, loN = 0, hi = 0, hiN = 0;
+      for (let v = t; v < 256; v++) {
+        if (v < t2) { lo += v * upper[v]; loN += upper[v]; } else { hi += v * upper[v]; hiN += upper[v]; }
+      }
+      if (loN && hiN && hi / hiN - lo / loN > 25 && hiN > n * 0.03) {
+        strict = new Uint8Array(n);
+        for (let i = 0; i < n; i++) strict[i] = mask[i] && Y[i] >= t2 ? 1 : 0;
+      }
+    }
+    return { mask, strict, Y };
+  }
+
+  /** Reduces a convex hull to 4 corners. */
+  function quadFromHull(cv, hull) {
+    const peri = cv.arcLength(hull, true);
+    for (const eps of [0.02, 0.035, 0.05, 0.08]) {
+      const approx = new cv.Mat();
+      cv.approxPolyDP(hull, approx, eps * peri, true);
+      const rows = approx.rows, d = approx.data32S;
+      const pts = rows === 4 ? [0, 1, 2, 3].map(k => ({ x: d[k * 2], y: d[k * 2 + 1] })) : null;
+      approx.delete();
+      if (pts) return pts;
+      if (rows < 4) break;
+    }
+    // Fallback: the hull's extreme points towards each corner.
+    const d = hull.data32S, pts = [];
+    for (let k = 0; k < hull.rows; k++) pts.push({ x: d[k * 2], y: d[k * 2 + 1] });
+    if (pts.length < 4) return null;
+    const pick = f => pts.reduce((a, b) => (f(b) > f(a) ? b : a));
+    return [pick(p => -p.x - p.y), pick(p => p.x - p.y), pick(p => p.x + p.y), pick(p => p.y - p.x)];
+  }
+
+  /**
+   * How page-like a candidate is: mostly paper-coloured inside, brighter than
+   * its surroundings, large, and near the middle. Faces, bookshelves and
+   * clothing fail the paper test; a window loses on size and position.
+   */
+  function scoreQuad(pts, paper, Y, w, h) {
+    const q = orderCorners(pts);
+    const area = polygonArea(q);
+    const margin = Math.sqrt(area) * 0.08;
+    const xs = q.map(p => p.x), ys = q.map(p => p.y);
+    const x0 = Math.max(0, Math.floor(Math.min(...xs) - margin)), x1 = Math.min(w - 1, Math.ceil(Math.max(...xs) + margin));
+    const y0 = Math.max(0, Math.floor(Math.min(...ys) - margin)), y1 = Math.min(h - 1, Math.ceil(Math.max(...ys) + margin));
+    let nIn = 0, paperIn = 0, sumIn = 0, nOut = 0, sumOut = 0;
+    for (let y = y0; y <= y1; y += 2) {
+      for (let x = x0; x <= x1; x += 2) {
+        let inside = true;
+        for (let k = 0; k < 4 && inside; k++) {
+          const a = q[k], b = q[(k + 1) % 4];
+          if ((b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x) < 0) inside = false;
+        }
+        const i = y * w + x;
+        if (inside) { nIn++; paperIn += paper[i]; sumIn += Y[i]; } else { nOut++; sumOut += Y[i]; }
+      }
+    }
+    if (!nIn) return { score: 0 };
+    const fill = paperIn / nIn;
+    const contrast = nOut ? sumIn / nIn - sumOut / nOut : 0;
+    const cx = xs.reduce((a, b) => a + b) / 4, cy = ys.reduce((a, b) => a + b) / 4;
+    const centre = 1 - 0.5 * Math.min(1, Math.hypot(cx - w / 2, cy - h / 2) / (Math.hypot(w, h) / 2));
+    const edge = Math.max(1.5, Math.min(w, h) * 0.004); // a cut-off page sits right on the border
+    const touchesEdge = q.some(p => p.x <= edge || p.y <= edge || p.x >= w - 1 - edge || p.y >= h - 1 - edge);
+    // The page is held up in the middle of the view; shapes centred near the
+    // edges (windows, door frames, pictures on the wall) are background.
+    const offCentre = Math.abs(cx - w / 2) > w * 0.3 || Math.abs(cy - h / 2) > h * 0.32;
+    if (fill < 0.55 || offCentre) return { score: 0, fill, contrast, touchesEdge, quad: q, offCentre };
+    const score = (area / (w * h)) * fill * fill * centre * (contrast > 10 ? 1 : 0.4) * (touchesEdge ? 0.6 : 1);
+    return { score, fill, contrast, touchesEdge, quad: q };
+  }
+
+  /**
+   * Finds the page in a frame. Candidates come from two places: regions that
+   * look like paper (bright, colourless, not skin), and outlines found by Canny
+   * edge detection. Each is scored by scoreQuad and the best one wins.
+   * Returns 4 ordered corners in the image's pixel coordinates (with
+   * `touchesEdge` set when the page runs off the frame), or null.
+   */
+  function detectQuad(imageData, minAreaRatio = 0.08, debug = null) {
     const cv = window.cv;
     if (!cv || !cv.Mat) return null;
     const w = imageData.width, h = imageData.height;
     const frameArea = w * h;
+    const skin = skinMask(imageData);
+    const skinUsable = skin.count < frameArea * 0.4;
+    const noSkin = new Uint8Array(frameArea);
+    const paper = paperMask(imageData, skinUsable ? skin.mask : noSkin);
+    const candidates = [];
+    const consider = pts => {
+      if (!pts) return;
+      const area = polygonArea(pts);
+      if (area >= frameArea * minAreaRatio && area < frameArea * 0.985 && looksLikePage(pts)) candidates.push(pts);
+    };
 
-    const src = cv.matFromImageData(imageData);
-    const gray = new cv.Mat();
-    const edges = new cv.Mat();
-    const contours = new cv.MatVector();
-    const hierarchy = new cv.Mat();
-    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
-    let best = null, bestArea = 0;
-
+    const mats = [];
+    const track = m => { mats.push(m); return m; };
     try {
+      // 1. Paper-coloured regions. Closing fills in the text; opening cuts thin bridges to the background.
+      const kc = Math.max(3, Math.round(w * 0.03)) | 1, ko = Math.max(3, Math.round(w * 0.012)) | 1;
+      const closeK = track(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(kc, kc)));
+      const openK = track(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(ko, ko)));
+      const masks = paper.strict === paper.mask ? [paper.mask] : [paper.mask, paper.strict];
+      // Pad with an empty margin: OpenCV's morphology treats pixels beyond the
+      // border as paper, which would glue a page near the edge onto the border.
+      const pad = kc, pw = w + pad * 2;
+      for (const mask of masks) {
+        const region = track(cv.Mat.zeros(h + pad * 2, pw, cv.CV_8UC1));
+        const rd = region.data;
+        for (let y = 0; y < h; y++) {
+          for (let x = 0; x < w; x++) if (mask[y * w + x]) rd[(y + pad) * pw + x + pad] = 255;
+        }
+        cv.morphologyEx(region, region, cv.MORPH_CLOSE, closeK);
+        cv.morphologyEx(region, region, cv.MORPH_OPEN, openK);
+        const regionContours = track(new cv.MatVector());
+        const hier = track(new cv.Mat());
+        cv.findContours(region, regionContours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        for (let i = 0; i < regionContours.size(); i++) {
+          const c = regionContours.get(i);
+          if (cv.contourArea(c) >= frameArea * minAreaRatio * 0.6) {
+            const hull = new cv.Mat();
+            cv.convexHull(c, hull); // the hull fills the notches left by thumbs
+            const q = quadFromHull(cv, hull);
+            consider(q && q.map(p => ({ x: Math.min(w - 1, Math.max(0, p.x - pad)), y: Math.min(h - 1, Math.max(0, p.y - pad)) })));
+            hull.delete();
+          }
+          c.delete();
+        }
+      }
+
+      // 2. Edge outlines (good on low-contrast backgrounds where colour alone isn't enough).
+      const src = track(cv.matFromImageData(imageData));
+      const gray = track(new cv.Mat());
+      const edges = track(new cv.Mat());
       cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-      // Treat skin as background: a thumb over the edge then only leaves a
-      // notch in the page outline, which the convex hull below fills back in.
-      const skin = skinMask(imageData);
-      if (skin.count < frameArea * 0.4) {
+      if (skinUsable) {
         const g = gray.data;
         for (let i = 0; i < frameArea; i++) if (skin.mask[i]) g[i] = 0;
       }
       cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0);
-      // "Auto Canny": thresholds based on the median brightness of the scene.
       const med = median(gray.data);
-      const lo = Math.max(20, 0.66 * med), hi = Math.max(60, Math.min(255, 1.33 * med));
-      cv.Canny(gray, edges, lo, hi);
-      cv.dilate(edges, edges, kernel); // close small gaps in the page outline
-      cv.findContours(edges, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
-
-      for (let i = 0; i < contours.size(); i++) {
-        const c = contours.get(i);
-        if (cv.contourArea(c) < frameArea * minAreaRatio * 0.6) { c.delete(); continue; }
-        // The convex hull ignores fingers holding the page.
-        const hull = new cv.Mat();
-        cv.convexHull(c, hull);
-        const peri = cv.arcLength(hull, true);
-        for (const eps of [0.02, 0.035, 0.05]) {
-          const approx = new cv.Mat();
-          cv.approxPolyDP(hull, approx, eps * peri, true);
-          if (approx.rows === 4) {
-            const d = approx.data32S;
-            const pts = [0, 1, 2, 3].map(k => ({ x: d[k * 2], y: d[k * 2 + 1] }));
-            const area = polygonArea(pts);
-            if (area > bestArea && area >= frameArea * minAreaRatio &&
-                area < frameArea * 0.985 && looksLikePage(pts)) {
-              best = pts;
-              bestArea = area;
-            }
-            approx.delete();
-            break;
-          }
-          approx.delete();
+      cv.Canny(gray, edges, Math.max(20, 0.66 * med), Math.max(60, Math.min(255, 1.33 * med)));
+      const k3 = track(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3)));
+      cv.dilate(edges, edges, k3);
+      const edgeContours = track(new cv.MatVector());
+      const h2 = track(new cv.Mat());
+      cv.findContours(edges, edgeContours, h2, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+      for (let i = 0; i < edgeContours.size(); i++) {
+        const c = edgeContours.get(i);
+        if (cv.contourArea(c) >= frameArea * minAreaRatio * 0.6) {
+          const hull = new cv.Mat();
+          cv.convexHull(c, hull);
+          consider(quadFromHull(cv, hull));
+          hull.delete();
         }
-        hull.delete();
         c.delete();
       }
     } finally {
-      src.delete(); gray.delete(); edges.delete();
-      contours.delete(); hierarchy.delete(); kernel.delete();
+      mats.forEach(m => m.delete());
     }
-    return best ? inset(orderCorners(best), 0.012) : null;
+
+    let best = null;
+    const scored = candidates.map(pts => scoreQuad(pts, paper.strict, paper.Y, w, h));
+    for (const s of scored) {
+      if (s.score > 0 && (!best || s.score > best.score)) best = s;
+    }
+    if (debug) {
+      debug.width = w;
+      debug.height = h;
+      debug.skin = skinUsable ? skin.mask : noSkin;
+      debug.paper = paper.strict;
+      debug.candidates = scored.filter(c => c.quad);
+      debug.best = best;
+    }
+    if (!best) return null;
+    const quad = inset(best.quad, 0.012);
+    quad.touchesEdge = best.touchesEdge;
+    return quad;
   }
 
   /** Pulls corners slightly toward the centre so the background doesn't show at the edges. */
