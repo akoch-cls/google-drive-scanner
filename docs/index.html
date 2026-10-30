@@ -61,6 +61,16 @@
           </div>
         </div>
         <div class="drop-hint hidden" id="dropHint">Drop photos to add them as pages</div>
+        <div class="debug hidden" id="debugPanel">
+          <div class="debug-head"><b>What the scanner sees</b><button class="icon-btn" id="debugClose" type="button" aria-label="Close troubleshooting view">×</button></div>
+          <canvas id="debugCanvas"></canvas>
+          <div class="debug-legend">
+            <span><i style="background:#f4f4f4"></i>paper</span><span><i style="background:#ff4d4d"></i>skin</span>
+            <span><i style="background:#ffd54f"></i>shapes</span><span><i style="background:#00e676"></i>chosen</span>
+          </div>
+          <pre id="debugText"></pre>
+          <button class="btn primary small block" id="debugSave" type="button">Save camera frame</button>
+        </div>
       </div>
 
       <div class="controls">
@@ -304,6 +314,7 @@
           <li><kbd>A</kbd> turn auto-capture on or off</li>
           <li><kbd>S</kbd> save</li>
           <li><kbd>Esc</kbd> close a window</li>
+          <li><kbd>D</kbd> troubleshooting view</li>
         </ul>
       </div>
     </div>

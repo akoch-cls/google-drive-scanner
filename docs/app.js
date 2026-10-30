@@ -56,7 +56,8 @@
     'turnInCheck', 'saveError', 'saveSize', 'confirmSave', 'saveBusy', 'saveBusyText', 'resultModal',
     'resultIcon', 'resultTitle', 'resultBody', 'resultActions', 'teacherModal', 'tCourse', 'tCreate', 'tLink',
     'tTitle', 'tDesc', 'tDue', 'tPoints', 'tCreateBtn', 'tWorkList', 'tResult', 'tError', 'tBusy', 'helpModal',
-    'toast', 'toastText', 'toastAction', 'edFingers', 'macTip', 'macTipClose', 'signInBtn', 'account', 'accountEmail', 'signOutBtn'
+    'toast', 'toastText', 'toastAction', 'edFingers', 'macTip', 'macTipClose',
+    'debugPanel', 'debugClose', 'debugCanvas', 'debugText', 'debugSave', 'signInBtn', 'account', 'accountEmail', 'signOutBtn'
   ].forEach(id => { el[id] = $(id); });
 
   const state = {
@@ -66,6 +67,7 @@
     autoEnabled: true,
     defaultFilter: 'enhanced',
     removeFingers: true,
+    debug: false,        // troubleshooting view (press D, or open with ?debug)
     capturing: false,
     loopTimer: null,
     prevGray: null,
@@ -344,8 +346,9 @@
     state.prevGray = gray;
 
     let found = null;
+    const debugInfo = state.debug ? {} : null;
     if (state.cvReady) {
-      try { found = Vision.detectQuad(frame); } catch (err) { console.warn('detect failed', err); }
+      try { found = Vision.detectQuad(frame, undefined, debugInfo); } catch (err) { console.warn('detect failed', err); }
     }
     updateQuad(found, sw, sh);
     if (found) state.quadCut = !!found.touchesEdge;
@@ -363,6 +366,7 @@
     updateAuto(!!q, steady, motion);
     drawOverlay(steady);
     updateStatus(steady);
+    if (debugInfo) drawDebug(frame, debugInfo, motion, steady);
   }
 
   /** Focus is measured at full resolution, on the middle of the page (or frame). */
@@ -452,6 +456,75 @@
     el.captureBtn.style.setProperty('--p', progress.toFixed(2));
     if (state.autoEnabled && a.armed && a.count >= CONFIG.autoFrames) capture();
   }
+
+  // ===========================================================================
+  // Troubleshooting view
+  // ===========================================================================
+
+  function setDebug(on) {
+    state.debug = on;
+    el.debugPanel.classList.toggle('hidden', !on);
+  }
+
+  /** Shows the detector's view: paper-coloured pixels, skin, every shape it considered, and the numbers behind its decisions. */
+  function drawDebug(frame, info, motion, steady) {
+    const c = el.debugCanvas;
+    const w = frame.width, h = frame.height;
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+    const ctx = c.getContext('2d');
+    const img = ctx.createImageData(w, h);
+    const d = img.data, src = frame.data;
+    for (let i = 0, j = 0; i < w * h; i++, j += 4) {
+      if (info.skin && info.skin[i]) { d[j] = 255; d[j + 1] = 77; d[j + 2] = 77; }
+      else if (info.paper && info.paper[i]) { d[j] = d[j + 1] = d[j + 2] = 244; }
+      else {
+        const g = ((src[j] * 77 + src[j + 1] * 150 + src[j + 2] * 29) >> 8) * 0.4;
+        d[j] = d[j + 1] = d[j + 2] = g;
+      }
+      d[j + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+    const outline = (q, color, width) => {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.beginPath();
+      q.forEach((p, k) => (k ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+      ctx.closePath();
+      ctx.stroke();
+    };
+    (info.candidates || []).forEach(cand => outline(cand.quad, cand.score > 0 ? '#ffd54f' : 'rgba(255,213,79,.35)', 1.5));
+    if (info.best) outline(info.best.quad, info.best.touchesEdge ? '#ffb020' : '#00e676', 3);
+
+    const f = state.focus, b = info.best;
+    const pct = v => (v == null ? '–' : Math.round(v * 100) + '%');
+    el.debugText.textContent = [
+      'shapes: ' + (info.candidates || []).length + (b ? '   chosen: paper ' + pct(b.fill) + ', contrast ' + Math.round(b.contrast) : '   chosen: none'),
+      'focus: ' + f.raw.toFixed(0) + ' / typical ' + f.typical.toFixed(0) + (mostlySharp() ? '  sharp' : '  blurry'),
+      'motion: ' + motion.toFixed(1) + (steady ? '  steady' : '  moving') + (state.quadCut ? '   page cut off' : ''),
+      'camera: ' + el.video.videoWidth + '×' + el.video.videoHeight
+    ].join('\n');
+  }
+
+  /** Downloads the current full-resolution camera frame, to send along with a problem report. */
+  function saveDebugFrame() {
+    const v = el.video;
+    if (!v.videoWidth) return;
+    const c = Vision.createCanvas(v.videoWidth, v.videoHeight);
+    c.getContext('2d').drawImage(v, 0, 0);
+    c.toBlob(blob => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'scanner-frame-' + new Date().toISOString().replace(/[:.]/g, '-') + '.jpg';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      toast('Saved ' + a.download);
+    }, 'image/jpeg', 0.92);
+  }
+
+  el.debugClose.addEventListener('click', () => setDebug(false));
+  el.debugSave.addEventListener('click', saveDebugFrame);
 
   function setStatus(text, kind) {
     if (el.statusText.textContent !== text) el.statusText.textContent = text;
@@ -1666,6 +1739,8 @@
     if (e.code === 'Space') {
       e.preventDefault();
       if (!el.captureBtn.disabled) capture();
+    } else if (e.key === 'd' || e.key === 'D') {
+      setDebug(!state.debug);
     } else if (e.key === 'a' || e.key === 'A') {
       el.autoToggle.click();
     } else if (e.key === 's' || e.key === 'S') {
@@ -1759,6 +1834,7 @@
     wasSignedIn = api.isSignedIn();
     renderAccount(wasSignedIn);
     const params = urlParams();
+    if ('debug' in params) setDebug(true);
     if (params.course && params.assignment) setTarget(params.course, params.assignment);
     if (wasSignedIn) checkTeacher();
   }

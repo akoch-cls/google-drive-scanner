@@ -108,6 +108,7 @@ Scanner handles both cases:
 | "API is not turned on" | Enable the Drive API and Classroom API in the Google Cloud project. |
 | Camera blocked | Click the camera icon in the address bar and allow it, then **Try again**. |
 | On a Mac, the picture keeps panning/zooming to follow your face and the page never holds still | Turn off **Center Stage**: while the camera is on, click the green camera icon in the menu bar (or Control Center → Video Effects). Turn off **Portrait** too. Web pages can't change this setting. |
+| It outlines the wrong thing, or won't capture the page | Press **D** (or open the site with `?debug` on the end of the address) to see what the scanner sees: paper-coloured areas in white, skin in red, every shape it considered in yellow, and its choice in green. **Save camera frame** downloads the current picture, which is the most useful thing to include in a problem report. |
 | "Move the page back so all four corners are in view" | Part of the page is outside the picture. Move it further from the camera, or lower the screen a little. |
 | Top bar says **Manual crop only** | OpenCV.js couldn't load from `docs.opencv.org` or `cdn.jsdelivr.net` (often a web filter). Allow those hosts, or put `opencv.js` in `docs/` and add `'opencv.js'` to `CV_URLS` in `docs/app.js`. |
 

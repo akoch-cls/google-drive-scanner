@@ -127,6 +127,11 @@ const Vision = (() => {
     }
     refCb /= m || 1;
     refCr /= m || 1;
+    // Cameras white-balance, so paper is close to neutral. Only allow a small
+    // tint: if a brightly lit face is the brightest thing in view, it must not
+    // become the reference (it would then stop counting as skin).
+    refCb = Math.min(134, Math.max(118, refCb));
+    refCr = Math.min(136, Math.max(122, refCr));
 
     const mask = new Uint8Array(n);
     let count = 0;
@@ -409,10 +414,10 @@ const Vision = (() => {
       if (acc >= n * 0.1) { cut = v; break; }
     }
     const bright = [];
-    for (let i = 0; i < n; i += 7) if (Y[i] >= cut) bright.push(sat[i]);
+    for (let i = 0; i < n; i += 7) if (Y[i] >= cut && !skin[i]) bright.push(sat[i]);
     bright.sort((a, b) => a - b);
     const tint = bright.length ? bright[bright.length >> 1] : 0;
-    const maxSat = Math.min(0.6, Math.max(0.3, tint + 0.15));
+    const maxSat = Math.min(0.4, Math.max(0.25, tint + 0.12));
 
     const mask = new Uint8Array(n);
     for (let i = 0; i < n; i++) mask[i] = Y[i] >= t && sat[i] < maxSat && !skin[i] ? 1 : 0;
@@ -488,7 +493,10 @@ const Vision = (() => {
     const centre = 1 - 0.5 * Math.min(1, Math.hypot(cx - w / 2, cy - h / 2) / (Math.hypot(w, h) / 2));
     const edge = Math.max(1.5, Math.min(w, h) * 0.004); // a cut-off page sits right on the border
     const touchesEdge = q.some(p => p.x <= edge || p.y <= edge || p.x >= w - 1 - edge || p.y >= h - 1 - edge);
-    if (fill < 0.55) return { score: 0, fill };
+    // The page is held up in the middle of the view; shapes centred near the
+    // edges (windows, door frames, pictures on the wall) are background.
+    const offCentre = Math.abs(cx - w / 2) > w * 0.3 || Math.abs(cy - h / 2) > h * 0.32;
+    if (fill < 0.55 || offCentre) return { score: 0, fill, contrast, touchesEdge, quad: q, offCentre };
     const score = (area / (w * h)) * fill * fill * centre * (contrast > 10 ? 1 : 0.4) * (touchesEdge ? 0.6 : 1);
     return { score, fill, contrast, touchesEdge, quad: q };
   }
@@ -500,7 +508,7 @@ const Vision = (() => {
    * Returns 4 ordered corners in the image's pixel coordinates (with
    * `touchesEdge` set when the page runs off the frame), or null.
    */
-  function detectQuad(imageData, minAreaRatio = 0.08) {
+  function detectQuad(imageData, minAreaRatio = 0.08, debug = null) {
     const cv = window.cv;
     if (!cv || !cv.Mat) return null;
     const w = imageData.width, h = imageData.height;
@@ -583,9 +591,17 @@ const Vision = (() => {
     }
 
     let best = null;
-    for (const pts of candidates) {
-      const s = scoreQuad(pts, paper.strict, paper.Y, w, h);
+    const scored = candidates.map(pts => scoreQuad(pts, paper.strict, paper.Y, w, h));
+    for (const s of scored) {
       if (s.score > 0 && (!best || s.score > best.score)) best = s;
+    }
+    if (debug) {
+      debug.width = w;
+      debug.height = h;
+      debug.skin = skinUsable ? skin.mask : noSkin;
+      debug.paper = paper.strict;
+      debug.candidates = scored.filter(c => c.quad);
+      debug.best = best;
     }
     if (!best) return null;
     const quad = inset(best.quad, 0.012);
