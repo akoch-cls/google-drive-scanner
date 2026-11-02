@@ -1,2 +1,5 @@
 .clasp.json
 node_modules/
+dev/eval/fixtures/
+dev/eval/private/
+__pycache__/

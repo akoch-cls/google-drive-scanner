@@ -110,22 +110,28 @@ Scanner handles both cases:
 | On a Mac, the picture keeps panning/zooming to follow your face and the page never holds still | Turn off **Center Stage**: while the camera is on, click the green camera icon in the menu bar (or Control Center → Video Effects). Turn off **Portrait** too. Web pages can't change this setting. |
 | It outlines the wrong thing, or won't capture the page | Press **D** (or open the site with `?debug` on the end of the address) to see what the scanner sees: paper-coloured areas in white, skin in red, every shape it considered in yellow, and its choice in green. **Save camera frame** downloads the current picture, which is the most useful thing to include in a problem report. |
 | "Move the page back so all four corners are in view" | Part of the page is outside the picture. Move it further from the camera, or lower the screen a little. |
+| Top bar doesn't say **· hand tracking** | The hand tracker couldn't load from `cdn.jsdelivr.net` / `storage.googleapis.com`. Scanning still works using skin colour to find fingers; allow those hosts for better finger handling. |
 | Top bar says **Manual crop only** | OpenCV.js couldn't load from `docs.opencv.org` or `cdn.jsdelivr.net` (often a web filter). Allow those hosts, or put `opencv.js` in `docs/` and add `'opencv.js'` to `CV_URLS` in `docs/app.js`. |
 
 ## How it works
 
 | Step | File | Technique |
 | --- | --- | --- |
-| Page detection | `vision.js` → `detectQuad` | Three candidate sources, each reduced to 4 corners via convex hull + polygon approximation: **(1) writing first** (`inkSeededCandidates`): thin dark strokes on a colourless background (closing − image), dense ink = text zone, paper colour sampled around the ink, region grown across smoothly-changing pixels of that colour until a sharp change (the page edge). This works whatever the exposure, e.g. when the camera exposes for a ceiling light and the page comes out mid-grey. **(2)** paper-coloured regions (bright, colourless, not skin). **(3)** Canny outlines. Candidates are rejected if off-centre, mostly blown-out white with no writing (lights, glare), with under 1% writing (walls, windows, doors), or not paper-coloured, then scored by size, fill, contrast and closeness to the centre (`scoreQuad`). Runs with OpenCV.js on a 480-px frame. |
-| Focus | `vision.js` → `sharpness` | Variance of the Laplacian on a full-resolution crop at the page centre, compared with the camera's typical value (80th percentile of the last ~2.5 s). Captures keep the sharpest of a 5-frame burst. |
-| Fingers | `vision.js` → `skinMask`, `removeFingers` | Skin colour judged relative to the paper's own tint (YCbCr). Skin regions touching the page border, plus the darker rim and shadow next to them, are filled from the surrounding paper colour; skin is ignored during edge detection. |
+| Page detection (coarse) | `vision.js` → `detectQuad` | Candidate outlines from three sources: **(1) writing first** (`inkSeededCandidates`): thin dark strokes on a colourless background, dense ink = text zone, paper colour sampled around it and the region grown out to the page edge, which works whatever the exposure; **(2)** paper-coloured regions; **(3)** Canny outlines; plus **(4)** the previous frame's page (a temporal prior, as in the best SmartDoc 2015 entries). Region boundaries become 4 sides by sequential RANSAC line fitting over boundary points away from hands (`quadFromContour`), so a corner under a thumb is recovered where its two sides meet. Candidates are rejected if off-centre, a blown-out light with no writing, under 1% writing, or not paper-coloured (`scoreQuad`). The top 4 are re-ranked by edge support after refinement. Runs with OpenCV.js on a 480-px frame. |
+| Page edges (precise) | `vision.js` → `refineQuad` | Detect low, refine high: each side is searched across a narrow band for the strongest brightness/colour *step* (not thin ink lines), points under fingers are skipped, and a line is fitted with RANSAC; corners are the line intersections. Done at 960 px every frame and at full camera resolution on the captured frame. |
+| Hands | `hands.js` | MediaPipe Hand Landmarker (pretrained, runs in the browser): 21 points per hand, rasterised into a finger mask. Edge points under it are ignored, and auto-capture waits while fingers cover more than 3% of the page interior ("Move your fingers to the edge of the page"). Falls back to the skin-colour mask if the model can't load. |
+| Tracking | `app.js` → `updateQuad` | One Euro filter on the corners (Casiez et al., 2012); the outline appears only after 3 consistent detections and is kept through 4 missed frames. |
+| Focus | `vision.js` → `sharpness` | Tenengrad (Sobel gradient energy above a noise floor), which holds up better than Laplacian measures on noisy webcams (Pertuz et al., 2013), on a full-resolution crop inside the page, compared with the camera's typical value over ~2.5 s. Captures keep the sharpest of a 5-frame burst. |
+| Fingers in the scan | `vision.js` → `skinMask`, `removeFingers` | Skin colour judged relative to the paper's own tint. Skin regions touching the page border, plus their darker rim and shadow, are filled from the surrounding paper colour. |
 | Steadiness | `vision.js` → `meanAbsDiff` | Frame-to-frame change, plus how much the outline moves. |
-| De-skew | `vision.js` → `warp` | Projective (homography) warp with bilinear sampling. |
+| De-skew | `vision.js` → `estimateAspect`, `warp` | The page's real aspect ratio is recovered from the outline's perspective (Zhang & He, whiteboard scanning), snapped to Letter/A4/Legal when close; then a homography warp of the full-resolution frame. Measuring edge lengths in the image instead distorts tilted pages. |
 | Clean-up | `vision.js` → `applyFilter` | Estimates the paper brightness (max-filter + blur on a shrunken copy), divides it out to remove shadows, then applies a levels curve. |
 | PDF | `google.js` → `buildPdf` | Embeds each JPEG as-is (no re-encoding), with pages sized to 11 in on the long edge. |
 | Google | `google.js` | Google Identity Services token sign-in, plus the Drive v3 and Classroom v1 REST APIs called directly from the browser. |
 
 Detection and focus thresholds are in the `CONFIG` block at the top of `docs/app.js`.
+
+Not implemented from the research: a trained page-segmentation or corner network (LDRNet, HU-PageScan) and learned dewarping of curled pages (DewarpNet, DocTr). Both need training data or are too heavy for a laptop in real time; the line-based pipeline above covers the finger-occlusion cases they're best known for.
 
 ## Local testing
 
@@ -140,6 +146,24 @@ assignments (`dev/mock-api.js`), so you can try everything without any Google se
 Run `node dev/serve.js` without `--mock` to use real Google sign-in. That needs
 `http://localhost:8080` in the client's Authorized JavaScript origins.
 
+### Measuring detection accuracy
+
+```bash
+python3 dev/eval/make_fixtures.py
+```
+
+```bash
+npm install --no-save playwright && npx playwright install chromium
+```
+
+```bash
+node dev/eval/run.js
+```
+
+`make_fixtures.py` renders synthetic webcam frames with known page corners: thumbs over the edges, a covered corner, a light wall, a screen-lit face, a ceiling light, strong tilt, a page cut off, and no page. `run.js` scores the detector with the SmartDoc 2015 metrics: IoU, maximum corner error ÷ page perimeter (correct below 0.017), aspect-ratio error, and false detections. Run it before and after changing detection.
+
+To score your own frames, save some with **Save camera frame** (press D), put them in `dev/eval/private/` with a `truth.json` (same format as `dev/eval/fixtures/truth.json`: four corners per frame, or `"expect": "none"`), and run `node dev/eval/run.js dev/eval/private --show`. That folder is git-ignored, since real frames show faces and student work.
+
 ## Project layout
 
 ```
@@ -147,11 +171,13 @@ docs/                  the website (GitHub Pages serves this folder)
   index.html           page markup
   styles.css           styles
   config.js            your Google OAuth client ID
-  vision.js            image processing: detection, focus, warp, filters
+  vision.js            image processing: detection, line refinement, aspect ratio, focus, warp, filters
+  hands.js             hand tracking (MediaPipe) → finger mask
   google.js            sign-in, Drive, Classroom, PDF builder
   app.js               UI: camera loop, auto-capture, editor, save flows
   manifest.webmanifest, icon.svg   lets Chrome install it as an app
 dev/
   serve.js             local server (camera needs localhost or https)
   mock-api.js          fake Google APIs for --mock
+  eval/                detection benchmark (make_fixtures.py, run.js)
 ```

@@ -5,14 +5,21 @@
   const CONFIG = {
     detectWidth: 480,     // frames are shrunk to this width for page detection
     tickMs: 100,          // analysis loop interval
-    autoFrames: 6,        // consecutive "ready" frames before auto-capture (~0.6 s)
+    autoFrames: 4,        // consecutive "ready" frames before auto-capture (after lock-on, ~0.6 s)
     cooldownMs: 1500,     // minimum time between auto-captures
-    minSharpness: 6,      // below this the image is blurry no matter what
+    minSharpness: 5,      // Tenengrad below this is blurry no matter what (a sharp webcam page ≈ 20)
     relSharpness: 0.7,    // sharp = at least this fraction of the camera's typical sharpness
     focusWindow: 25,      // frames (~2.5 s) used to learn the camera's typical sharpness
     burstFrames: 5,       // frames grabbed per capture; the sharpest one is kept
     steadyMotion: 6,      // frame-to-frame change below this = steady (hand-held paper trembles)
     steadyQuad: 0.025,    // outline movement per frame below this = steady (fraction of frame)
+    refineWidth: 960,     // page edges are refined at this width every frame (and at full size on capture)
+    lockFrames: 3,        // consistent detections needed before the outline appears (hysteresis)
+    dropFrames: 4,        // missed detections tolerated before the outline disappears
+    euro: { minCutoff: 1.0, beta: 4, dCutoff: 1.0 }, // One Euro filter on the corners
+    minPageArea: 0.1,     // page must fill this fraction of the view to auto-capture
+    maxFingerCover: 0.03, // max share of the page interior under fingers (hand tracker)
+    maxSkinCover: 0.06,   // same, when only the skin-colour mask is available
     rearmMotion: 8,       // change above this = the page is being swapped
     maxOutputDim: 2200,   // longest edge of a finished page, in pixels
     maxSourceDim: 3200,   // uploaded photos are shrunk to this first
@@ -75,6 +82,13 @@
     quadStable: false,
     quadMiss: 0,
     quadCut: false,      // the page runs off the edge of the frame
+    rawQuad: null,       // latest unsmoothed detection (also the prior for the next frame)
+    lock: 0,             // consecutive consistent detections
+    fingersOver: false,  // fingers cover the writing
+    pageSmall: false,    // page too far away
+    hands: [],
+    handInfo: null,      // { mask, width, height, source } at detection size
+    tickCount: 0,
     focus: { raw: 0, history: [], typical: 0, rel: 0, sharp: false, log: [] },
     auto: { armed: true, count: 0, disturbed: 0, lastCapture: 0, justCaptured: -Infinity, captured: 0 },
     openModals: [],
@@ -91,7 +105,7 @@
   // Shrinking a 1080p frame to 480 px in one step skips pixels and makes the
   // image grainy, which throws off page detection; halve it first.
   const halfCanvas = Vision.createCanvas(960, 540);
-  const halfCtx = halfCanvas.getContext('2d');
+  const halfCtx = Vision.ctx2d(halfCanvas);
   const focusCanvas = Vision.createCanvas(400, 300);
   const focusCtx = Vision.ctx2d(focusCanvas);
 
@@ -240,7 +254,12 @@
 
   function onCvReady() {
     state.cvReady = true;
-    el.cvStatus.textContent = 'Edge detection on';
+    renderEngineChip();
+  }
+
+  function renderEngineChip() {
+    if (!state.cvReady) return;
+    el.cvStatus.textContent = 'Edge detection on' + (Hands.status() === 'ready' ? ' · hand tracking' : '');
     el.cvStatus.className = 'chip ok';
   }
 
@@ -341,17 +360,13 @@
       workCanvas.width = sw;
       workCanvas.height = sh;
     }
-    if (vw > sw * 2.5) {
-      const hw = sw * 2, hh = sh * 2;
-      if (halfCanvas.width !== hw || halfCanvas.height !== hh) { halfCanvas.width = hw; halfCanvas.height = hh; }
-      halfCtx.imageSmoothingQuality = 'high';
-      halfCtx.drawImage(v, 0, 0, hw, hh);
-      workCtx.imageSmoothingQuality = 'high';
-      workCtx.drawImage(halfCanvas, 0, 0, sw, sh);
-    } else {
-      workCtx.imageSmoothingQuality = 'high';
-      workCtx.drawImage(v, 0, 0, sw, sh);
-    }
+    // Two-level pyramid: ~960 px for refining edges, 480 px for detection.
+    const hw = Math.min(vw, CONFIG.refineWidth), hh = Math.round(vh * hw / vw);
+    if (halfCanvas.width !== hw || halfCanvas.height !== hh) { halfCanvas.width = hw; halfCanvas.height = hh; }
+    halfCtx.imageSmoothingQuality = 'high';
+    halfCtx.drawImage(v, 0, 0, hw, hh);
+    workCtx.imageSmoothingQuality = 'high';
+    workCtx.drawImage(halfCanvas, 0, 0, sw, sh);
     const frame = workCtx.getImageData(0, 0, sw, sh);
 
     const gray = Vision.toGray(frame);
@@ -359,13 +374,41 @@
       ? Vision.meanAbsDiff(gray, state.prevGray) : 99;
     state.prevGray = gray;
 
+    // Hands: the tracker runs every other frame; between runs the last mask is reused.
+    if (Hands.status() === 'ready' && state.tickCount++ % 2 === 0) state.hands = Hands.track(v);
+    const handMask = state.hands.length ? Hands.mask(state.hands, sw, sh) : null;
+    state.handInfo = handMask ? { mask: handMask, width: sw, height: sh, source: 'tracker' } : null;
+
     let found = null;
     const debugInfo = state.debug ? {} : null;
     if (state.cvReady) {
-      try { found = Vision.detectQuad(frame, undefined, debugInfo); } catch (err) { console.warn('detect failed', err); }
+      try {
+        const prior = state.rawQuad ? state.rawQuad.map(p => ({ x: p.x * sw, y: p.y * sh })) : null;
+        found = Vision.detectQuad(frame, { debug: debugInfo, prior, hand: state.handInfo });
+        if (found) {
+          // Snap the edges again at twice the resolution.
+          const half = halfCtx.getImageData(0, 0, hw, hh), s = hw / sw;
+          const r = Vision.refineQuad(half, found.map(p => ({ x: p.x * s, y: p.y * s })), {
+            hand: state.handInfo, band: Math.sqrt(Vision.polygonArea(found)) * s * 0.025
+          });
+          const refined = r.quad.map(p => ({ x: p.x / s, y: p.y / s }));
+          refined.touchesEdge = found.touchesEdge;
+          refined.support = r.support;
+          found = refined;
+        }
+      } catch (err) { console.warn('detect failed', err); }
     }
     updateQuad(found, sw, sh);
-    if (found) state.quadCut = !!found.touchesEdge;
+    if (found) {
+      state.quadCut = !!found.touchesEdge;
+      state.pageSmall = Vision.polygonArea(found) < sw * sh * CONFIG.minPageArea;
+      // Fingers over the writing (the page interior, away from the margins)?
+      const cover = state.handInfo
+        ? Vision.maskCoverage(found, state.handInfo.mask, sw, sh, 0.15)
+        : Vision.maskCoverage(found, Vision.skinMask(frame).mask, sw, sh, 0.15);
+      state.fingersOver = cover > (state.handInfo ? CONFIG.maxFingerCover : CONFIG.maxSkinCover);
+      if (debugInfo) { debugInfo.cover = cover; debugInfo.support = found.support; }
+    }
 
     const q = state.quad;
     const r = focusRegion(vw, vh);
@@ -400,25 +443,56 @@
     return a.reduce((s, p, i) => s + Math.hypot(p.x - b[i].x, p.y - b[i].y), 0) / 4;
   }
 
-  function updateQuad(found, w, h) {
-    if (found) {
-      const n = found.map(p => ({ x: p.x / w, y: p.y / h }));
-      const prev = state.quad;
-      const d = prev ? quadDistance(prev, n) : Infinity;
-      if (d < 0.08) {
-        state.quadStable = d < CONFIG.steadyQuad;
-        state.quad = prev.map((p, i) => ({ x: (p.x + n[i].x) / 2, y: (p.y + n[i].y) / 2 }));
-      } else {
-        if (!prev) state.focus.history = []; // new page: relearn what "sharp" looks like
-        state.quad = n;
-        state.quadStable = false;
+  /**
+   * One Euro filter (Casiez et al., CHI 2012): a low-pass filter whose cutoff
+   * rises with speed, so the outline is steady when the page is still and
+   * keeps up when it moves.
+   */
+  function oneEuro({ minCutoff, beta, dCutoff }) {
+    let x = null, dx = 0, t = 0;
+    const alpha = (cutoff, dt) => 1 / (1 + 1 / (2 * Math.PI * cutoff * dt));
+    return {
+      reset() { x = null; },
+      filter(value, time) {
+        if (x === null) { x = value; dx = 0; t = time; return x; }
+        const dt = Math.max(1e-3, time - t);
+        t = time;
+        dx += alpha(dCutoff, dt) * ((value - x) / dt - dx);
+        x += alpha(minCutoff + beta * Math.abs(dx), dt) * (value - x);
+        return x;
       }
+    };
+  }
+  const cornerFilters = Array.from({ length: 8 }, () => oneEuro(CONFIG.euro));
+
+  /**
+   * Tracks the page across frames: lock on only after a few consistent
+   * detections, smooth the corners, and keep the outline through short
+   * dropouts (a finger passing over an edge).
+   */
+  function updateQuad(found, w, h) {
+    const now = performance.now() / 1000;
+    if (found) {
+      const n = Vision.orderCorners(found).map(p => ({ x: p.x / w, y: p.y / h }));
+      const d = state.rawQuad ? quadDistance(state.rawQuad, n) : Infinity;
+      if (d >= 0.08) { cornerFilters.forEach(f => f.reset()); state.lock = 0; }
+      state.lock++;
+      state.quadStable = d < CONFIG.steadyQuad;
+      state.rawQuad = n;
       state.quadMiss = 0;
-    } else if (state.quad && ++state.quadMiss <= 3) {
+      const smooth = n.map((p, i) => ({ x: cornerFilters[i * 2].filter(p.x, now), y: cornerFilters[i * 2 + 1].filter(p.y, now) }));
+      if (state.lock >= CONFIG.lockFrames) {
+        if (!state.quad) state.focus.history = []; // new page: relearn what "sharp" looks like
+        state.quad = smooth;
+      }
+    } else if (state.rawQuad && ++state.quadMiss <= CONFIG.dropFrames) {
       state.quadStable = false; // brief dropout: keep the last outline
     } else {
       state.quad = null;
+      state.rawQuad = null;
+      state.lock = 0;
       state.quadStable = false;
+      state.fingersOver = state.pageSmall = false;
     }
   }
 
@@ -464,7 +538,7 @@
       }
     }
     // Every frame doesn't have to be sharp: the capture burst keeps the sharpest one.
-    const ready = hasPage && !state.quadCut && steady && mostlySharp();
+    const ready = hasPage && !state.quadCut && !state.pageSmall && !state.fingersOver && steady && mostlySharp();
     a.count = ready ? a.count + 1 : 0;
     const progress = state.autoEnabled && a.armed ? Math.min(1, a.count / CONFIG.autoFrames) : 0;
     el.captureBtn.style.setProperty('--p', progress.toFixed(2));
@@ -520,6 +594,9 @@
       'rejected: ' + (rejected || '–'),
       'focus: ' + f.raw.toFixed(0) + ' / typical ' + f.typical.toFixed(0) + (mostlySharp() ? '  sharp' : '  blurry'),
       'motion: ' + motion.toFixed(1) + (steady ? '  steady' : '  moving') + (state.quadCut ? '   page cut off' : ''),
+      'fingers: ' + (state.handInfo ? 'hand tracker' : 'skin colour') + (info.cover != null ? ', ' + pct(info.cover) + ' of page interior' : '') +
+        (state.fingersOver ? '  TOO MUCH' : ''),
+      'edge support: ' + (info.support ? info.support.map(v => pct(v)).join(' ') : '–'),
       'camera: ' + el.video.videoWidth + '×' + el.video.videoHeight
     ].join('\n');
   }
@@ -559,6 +636,10 @@
       setStatus(state.cvReady ? 'Hold a page up to the camera' : 'Frame the page, then capture', state.cvReady ? '' : 'warn');
     } else if (state.quadCut) {
       setStatus('Move the page back so all four corners are in view', 'warn');
+    } else if (state.pageSmall) {
+      setStatus('Bring the page closer', 'warn');
+    } else if (state.fingersOver) {
+      setStatus('Move your fingers to the edge of the page', 'warn');
     } else if (!steady) {
       setStatus('Hold steady…', 'warn');
     } else if (!mostlySharp()) {
@@ -606,9 +687,10 @@
       return;
     }
 
-    const ready = !state.quadCut && steady && mostlySharp();
+    const blocked = state.quadCut || state.pageSmall || state.fingersOver;
+    const ready = !blocked && steady && mostlySharp();
     const pts = state.quad.map(p => ({ x: r.x + p.x * r.w, y: r.y + p.y * r.h }));
-    const color = ready ? '52,208,88' : state.quadCut ? '255,176,32' : '138,180,248';
+    const color = ready ? '52,208,88' : blocked ? '255,176,32' : '138,180,248';
     ctx.beginPath();
     pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
     ctx.closePath();
@@ -685,7 +767,14 @@
       a.captured = state.pages.length + 1;
       el.captureBtn.style.setProperty('--p', 0);
 
-      const corners = quad ? quad.map(p => ({ x: p.x * vw, y: p.y * vh })) : null;
+      let corners = quad ? quad.map(p => ({ x: p.x * vw, y: p.y * vh })) : null;
+      if (corners) {
+        // Final edge fit on the full-resolution frame (detect low, refine high).
+        const full = Vision.ctx2d(canvas).getImageData(0, 0, vw, vh);
+        corners = Vision.refineQuad(full, corners, {
+          hand: state.handInfo, band: Math.sqrt(Vision.polygonArea(corners)) * 0.015
+        }).quad;
+      }
       const blob = await toBlob(canvas, 'image/jpeg', 0.92);
       await addPage(blob, vw, vh, corners);
     } catch (err) {
@@ -724,15 +813,11 @@
   /** Runs page detection on a still image. Returns corners in its pixels, or null. */
   function detectInImage(source) {
     if (!state.cvReady) return null;
-    const w = 720, h = Math.round(source.height * w / source.width);
-    const c = Vision.createCanvas(w, h);
-    const ctx = Vision.ctx2d(c);
-    ctx.drawImage(source, 0, 0, w, h);
     try {
-      const q = Vision.detectQuad(ctx.getImageData(0, 0, w, h), 0.08);
-      const s = source.width / w;
-      return q ? q.map(p => ({ x: p.x * s, y: p.y * s })) : null;
+      const found = Vision.locatePage(source);
+      return found ? found.corners : null;
     } catch (err) {
+      console.warn('detect failed', err);
       return null;
     }
   }
@@ -760,7 +845,9 @@
     page.pending = (async () => {
       const bmp = await createImageBitmap(page.blob);
       try {
-        let out = Vision.warp(bmp, page.corners, CONFIG.maxOutputDim);
+        // Flatten to the page's real shape (Zhang & He), trimming a hair off the edges.
+        page.aspect = Vision.estimateAspect(page.corners, page.w, page.h);
+        let out = Vision.warp(bmp, Vision.inset(Vision.orderCorners(page.corners), 0.004), CONFIG.maxOutputDim, page.aspect.ratio);
         out = Vision.rotate(out, page.rotation);
         page.fingersFound = page.removeFingers ? Vision.removeFingers(out) > 0 : false;
         Vision.applyFilter(out, page.filter);
@@ -1847,6 +1934,10 @@
     loadOpenCv();
     startCamera(store('camera'));
     showMacTip();
+    Hands.load().then(status => {
+      if (status === 'ready') el.cvStatus.title += ' Hand tracking is on.';
+      renderEngineChip();
+    });
 
     state.recent = store('recentFolders') || [];
     if (!state.dest) state.dest = state.recent[0] || null;
