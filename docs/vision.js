@@ -75,22 +75,26 @@ const Vision = (() => {
     return sum / n;
   }
 
-  /** Variance of the Laplacian: high when edges are crisp, low when blurry. */
+  /**
+   * Tenengrad focus measure: mean squared Sobel gradient above a noise floor.
+   * Pertuz et al. (2013) found Laplacian-based measures the most sensitive to
+   * noise; gradient measures hold up better on noisy laptop webcams.
+   */
   function sharpness(imageData) {
     const w = imageData.width, h = imageData.height;
     const g = toGray(imageData);
-    let sum = 0, sum2 = 0, n = 0;
+    const floor = 24 * 24; // ignore sensor-noise gradients (Sobel units, 4× pixel step)
+    let sum = 0, n = 0;
     for (let y = 1; y < h - 1; y++) {
       for (let x = 1, i = y * w + 1; x < w - 1; x++, i++) {
-        const lap = 4 * g[i] - g[i - 1] - g[i + 1] - g[i - w] - g[i + w];
-        sum += lap;
-        sum2 += lap * lap;
+        const gx = g[i - w + 1] + 2 * g[i + 1] + g[i + w + 1] - g[i - w - 1] - 2 * g[i - 1] - g[i + w - 1];
+        const gy = g[i + w - 1] + 2 * g[i + w] + g[i + w + 1] - g[i - w - 1] - 2 * g[i - w] - g[i - w + 1];
+        const m = gx * gx + gy * gy;
+        if (m > floor) sum += m;
         n++;
       }
     }
-    if (!n) return 0;
-    const mean = sum / n;
-    return sum2 / n - mean * mean;
+    return n ? sum / n / 16 : 0;
   }
 
   // -------------------------------------------------------------------------
@@ -463,6 +467,59 @@ const Vision = (() => {
   }
 
   /**
+   * Four straight sides from a region's boundary, skipping boundary points next
+   * to a hand: sequential RANSAC finds the 4 dominant lines, which are ordered
+   * around the region and intersected. A corner under a thumb comes back as
+   * the meeting point of its two visible sides. Returns null when 4 clear
+   * sides can't be found (the caller falls back to the convex hull).
+   */
+  function quadFromContour(cv, contour, hand, w, h) {
+    const d = contour.data32S, n = contour.rows;
+    if (n < 40) return null;
+    const near = (x, y) => {
+      if (!hand) return false;
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const xx = x + dx, yy = y + dy;
+          if (xx >= 0 && yy >= 0 && xx < w && yy < h && hand[yy * w + xx]) return true;
+        }
+      }
+      return false;
+    };
+    let pts = [];
+    let cx = 0, cy = 0;
+    for (let k = 0; k < n; k++) {
+      const x = d[k * 2], y = d[k * 2 + 1];
+      cx += x; cy += y;
+      // Skip the frame border too: a page running off the frame has no real edge there.
+      if (x <= 1 || y <= 1 || x >= w - 2 || y >= h - 2 || near(x, y)) continue;
+      pts.push({ x, y });
+    }
+    cx /= n; cy /= n;
+    const total = pts.length;
+    const lines = [];
+    for (let k = 0; k < 4 && pts.length >= 10; k++) {
+      const fit = ransacLine(pts, 1.5, 120);
+      if (!fit || fit.inliers < Math.max(10, total * 0.06)) break;
+      const l = fit.line;
+      const inl = pts.filter(p => Math.abs(l.nx * p.x + l.ny * p.y - l.c) <= 2.5);
+      const mx = inl.reduce((s, p) => s + p.x, 0) / inl.length, my = inl.reduce((s, p) => s + p.y, 0) / inl.length;
+      lines.push({ l, angle: Math.atan2(my - cy, mx - cx) });
+      pts = pts.filter(p => Math.abs(l.nx * p.x + l.ny * p.y - l.c) > 2.5);
+    }
+    if (lines.length < 4) return null;
+    lines.sort((a, b) => a.angle - b.angle);
+    const out = [];
+    for (let k = 0; k < 4; k++) {
+      const p = intersect(lines[k].l, lines[(k + 1) % 4].l);
+      if (!p) return null;
+      out.push(p);
+    }
+    const q = orderCorners(out);
+    return isConvex(q) ? q : null;
+  }
+
+  /**
    * How page-like a candidate is: mostly paper-coloured inside, brighter than
    * its surroundings, large, and near the middle. Faces, bookshelves and
    * clothing fail the paper test; a window loses on size and position.
@@ -617,7 +674,7 @@ const Vision = (() => {
       for (let i = 0; i < n; i++) region[i] = rd[i] ? 1 : 0;
       const rc = track(new cv.MatVector());
       const rh = track(new cv.Mat());
-      cv.findContours(rm, rc, rh, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      cv.findContours(rm, rc, rh, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE);
       let bestI = -1, bestA = 0;
       for (let i = 0; i < rc.size(); i++) {
         const c = rc.get(i);
@@ -627,6 +684,8 @@ const Vision = (() => {
       }
       if (bestI < 0) continue;
       const c = rc.get(bestI);
+      const lineQuad = quadFromContour(cv, c, skin, w, h);
+      if (lineQuad) candidates.push({ pts: lineQuad, mask: region });
       const hull = new cv.Mat();
       cv.convexHull(c, hull);
       const pts = quadFromHull(cv, hull);
@@ -637,6 +696,276 @@ const Vision = (() => {
     return { ink, candidates };
   }
 
+  // -------------------------------------------------------------------------
+  // Line-based refinement (robust to fingers over the edges)
+  // -------------------------------------------------------------------------
+
+  function lineThrough(p, d) { // normalised line n·x = c through p with direction d
+    const len = Math.hypot(d.x, d.y) || 1;
+    const nx = -d.y / len, ny = d.x / len;
+    return { nx, ny, c: nx * p.x + ny * p.y };
+  }
+
+  function intersect(l1, l2) {
+    const det = l1.nx * l2.ny - l1.ny * l2.nx;
+    if (Math.abs(det) < 1e-9) return null;
+    return { x: (l1.c * l2.ny - l1.ny * l2.c) / det, y: (l1.nx * l2.c - l1.c * l2.nx) / det };
+  }
+
+  /** Total-least-squares line through points (principal axis). */
+  function fitLine(pts) {
+    let mx = 0, my = 0;
+    pts.forEach(p => { mx += p.x; my += p.y; });
+    mx /= pts.length; my /= pts.length;
+    let sxx = 0, sxy = 0, syy = 0;
+    pts.forEach(p => { const dx = p.x - mx, dy = p.y - my; sxx += dx * dx; sxy += dx * dy; syy += dy * dy; });
+    const theta = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+    return lineThrough({ x: mx, y: my }, { x: Math.cos(theta), y: Math.sin(theta) });
+  }
+
+  /** RANSAC line fit; returns the refit line and its inliers. */
+  function ransacLine(pts, tol, iterations = 60) {
+    if (pts.length < 2) return null;
+    let bestInliers = null;
+    let seed = 12345; // deterministic, so the same frame gives the same answer
+    const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+    for (let it = 0; it < iterations; it++) {
+      const a = pts[(rand() * pts.length) | 0], b = pts[(rand() * pts.length) | 0];
+      if (a === b) continue;
+      const l = lineThrough(a, { x: b.x - a.x, y: b.y - a.y });
+      const inl = pts.filter(p => Math.abs(l.nx * p.x + l.ny * p.y - l.c) <= tol);
+      if (!bestInliers || inl.length > bestInliers.length) bestInliers = inl;
+    }
+    if (!bestInliers || bestInliers.length < 2) return null;
+    let line = fitLine(bestInliers);
+    // One more pass with the refit line.
+    const inl = pts.filter(p => Math.abs(line.nx * p.x + line.ny * p.y - line.c) <= tol);
+    if (inl.length >= 2) line = fitLine(inl);
+    return { line, inliers: inl.length };
+  }
+
+  /**
+   * Snaps a rough page outline onto the real page edges, the way the best
+   * SmartDoc 2015 methods do: search across a band around each side for the
+   * strongest step in brightness/colour (a step, not a thin ink line), skip
+   * points under fingers, fit a straight line to each side with RANSAC, and
+   * intersect neighbouring lines for the corners. A corner hidden under a
+   * thumb is recovered from its two sides. Sides with too little support
+   * (covered, or off the frame) keep their rough position.
+   *
+   * @param imageData  RGBA frame at the refinement resolution
+   * @param quad       rough corners in that frame's pixels (TL, TR, BR, BL)
+   * @param opts.hand  optional { mask, width, height } finger mask at any resolution
+   * @returns { quad, support: [4 fractions], meanSupport }
+   */
+  function refineQuad(imageData, quad, opts = {}) {
+    const w = imageData.width, h = imageData.height, d = imageData.data;
+    const q = orderCorners(quad);
+    const size = Math.sqrt(polygonArea(q));
+    const band = Math.max(4, Math.round(opts.band || size * 0.05));
+    const win = Math.max(2, Math.round(Math.min(w, h) / 270 * 1.5)); // step window ~ blur width
+    const tol = Math.max(1, Math.min(w, h) / 270 * 0.8);
+    const hand = opts.hand;
+    const handAt = (x, y) => {
+      if (!hand) return false;
+      const hx = (x * hand.width / w) | 0, hy = (y * hand.height / h) | 0;
+      return hx >= 0 && hy >= 0 && hx < hand.width && hy < hand.height && hand.mask[hy * hand.width + hx] === 1;
+    };
+    const sample = (x, y) => { // bilinear luma + Cb (paper vs. cream walls differ in both)
+      if (x < 0 || y < 0 || x >= w - 1 || y >= h - 1) return null;
+      const x0 = x | 0, y0 = y | 0, ax = x - x0, ay = y - y0;
+      const i = (y0 * w + x0) * 4;
+      let Y = 0, C = 0;
+      const wts = [(1 - ax) * (1 - ay), ax * (1 - ay), (1 - ax) * ay, ax * ay];
+      [i, i + 4, i + w * 4, i + w * 4 + 4].forEach((j, k) => {
+        Y += wts[k] * (d[j] * 0.299 + d[j + 1] * 0.587 + d[j + 2] * 0.114);
+        C += wts[k] * (-0.168736 * d[j] - 0.331264 * d[j + 1] + 0.5 * d[j + 2]);
+      });
+      return { Y, C };
+    };
+
+    const lines = [], support = [];
+    for (let k = 0; k < 4; k++) {
+      const a = q[k], b = q[(k + 1) % 4];
+      const len = dist(a, b);
+      const dir = { x: (b.x - a.x) / len, y: (b.y - a.y) / len };
+      const cx = (q[0].x + q[1].x + q[2].x + q[3].x) / 4, cy = (q[0].y + q[1].y + q[2].y + q[3].y) / 4;
+      let nrm = { x: -dir.y, y: dir.x };
+      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      if ((cx - mid.x) * nrm.x + (cy - mid.y) * nrm.y > 0) nrm = { x: -nrm.x, y: -nrm.y }; // point outwards
+      const steps = Math.max(8, Math.round(len / Math.max(2, len / 80)));
+      const pts = [];
+      let usable = 0;
+      for (let si = 0; si < steps; si++) {
+        const t = 0.06 + 0.88 * si / (steps - 1);
+        const px = a.x + (b.x - a.x) * t, py = a.y + (b.y - a.y) * t;
+        if (handAt(px, py)) continue;
+        // profile across the side, from inside (−band) to outside (+band)
+        const prof = [];
+        let ok = true;
+        for (let o = -band - win; o <= band + win; o++) {
+          const v = sample(px + nrm.x * o, py + nrm.y * o);
+          if (!v) { ok = false; break; }
+          prof.push(v);
+        }
+        if (!ok) continue;
+        usable++;
+        let bestE = 0, bestO = 0;
+        for (let o = -band; o <= band; o++) {
+          const c = o + band + win;
+          let yin = 0, yout = 0, cin = 0, cout = 0;
+          for (let k2 = 1; k2 <= win; k2++) {
+            yin += prof[c - k2].Y; yout += prof[c + k2].Y;
+            cin += prof[c - k2].C; cout += prof[c + k2].C;
+          }
+          const e = Math.abs(yin - yout) / win + 1.5 * Math.abs(cin - cout) / win;
+          if (e > bestE) { bestE = e; bestO = o; }
+        }
+        if (bestE < 10) continue; // no clear edge here
+        const ex = px + nrm.x * bestO, ey = py + nrm.y * bestO;
+        if (handAt(ex, ey)) continue;
+        pts.push({ x: ex, y: ey });
+      }
+      const fit = pts.length >= 6 ? ransacLine(pts, tol) : null;
+      const sup = fit ? fit.inliers / steps : 0;
+      support.push(sup);
+      // Trust the fitted side only with enough support and a sane angle change.
+      const roughLine = lineThrough(a, dir);
+      if (fit && sup >= 0.3 && Math.abs(fit.line.nx * roughLine.nx + fit.line.ny * roughLine.ny) > Math.cos(0.2)) {
+        lines.push(fit.line);
+      } else {
+        lines.push(roughLine);
+      }
+    }
+    const out = [];
+    for (let k = 0; k < 4; k++) {
+      const p = intersect(lines[(k + 3) % 4], lines[k]); // corner k is between side k-1 and side k
+      if (!p || dist(p, q[k]) > size * 0.15) return { quad: q, support, meanSupport: support.reduce((x, y) => x + y) / 4, refined: false };
+      out.push(p);
+    }
+    if (!isConvex(out)) return { quad: q, support, meanSupport: support.reduce((x, y) => x + y) / 4, refined: false };
+    return { quad: out, support, meanSupport: support.reduce((x, y) => x + y) / 4, refined: true };
+  }
+
+  // -------------------------------------------------------------------------
+  // Page aspect ratio (Zhang & He, "Whiteboard scanning and image enhancement")
+  // -------------------------------------------------------------------------
+
+  const PAPER_RATIOS = [{ name: 'Letter', r: 11 / 8.5 }, { name: 'A4', r: Math.SQRT2 }, { name: 'Legal', r: 14 / 8.5 }];
+
+  /**
+   * Recovers the real height/width ratio of the page from its outline in the
+   * image, assuming square pixels and the principal point at the image centre.
+   * Falls back to the affine estimate when the page faces the camera almost
+   * square-on (focal length can't be recovered), and snaps to Letter/A4/Legal
+   * when close. Measuring edge lengths in the image instead is badly wrong once
+   * the page is tilted (≈6% at 25°, 21% at 30°).
+   * @returns {{ ratio: number, focal: number|null, method: string }}  ratio = height / width
+   */
+  function estimateAspect(corners, imageW, imageH) {
+    const [tl, tr, br, bl] = orderCorners(corners);
+    const u0 = imageW / 2, v0 = imageH / 2;
+    // Zhang & He's numbering: m1=(0,0), m2=(w,0), m3=(0,h), m4=(w,h).
+    const m = [tl, tr, bl, br].map(p => [p.x - u0, p.y - v0, 1]);
+    const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    const c14 = cross(m[0], m[3]);
+    const k2 = dot(c14, m[2]) / dot(cross(m[1], m[3]), m[2]);
+    const k3 = dot(c14, m[1]) / dot(cross(m[2], m[3]), m[1]);
+    const n2 = [k2 * m[1][0] - m[0][0], k2 * m[1][1] - m[0][1], k2 - 1];
+    const n3 = [k3 * m[2][0] - m[0][0], k3 * m[2][1] - m[0][1], k3 - 1];
+    const f2 = -(n2[0] * n3[0] + n2[1] * n3[1]) / (n2[2] * n3[2]);
+    let ratio, focal = null, method;
+    const fOk = isFinite(f2) && f2 > Math.pow(0.35 * imageW, 2) && f2 < Math.pow(3 * imageW, 2) &&
+      Math.abs(n2[2] * n3[2]) > 1e-6;
+    if (fOk) {
+      focal = Math.sqrt(f2);
+      const wLen = (n2[0] * n2[0] + n2[1] * n2[1]) / f2 + n2[2] * n2[2];
+      const hLen = (n3[0] * n3[0] + n3[1] * n3[1]) / f2 + n3[2] * n3[2];
+      ratio = Math.sqrt(hLen / wLen);
+      method = 'perspective';
+    } else {
+      ratio = Math.sqrt((n3[0] * n3[0] + n3[1] * n3[1]) / (n2[0] * n2[0] + n2[1] * n2[1]));
+      method = 'affine';
+    }
+    if (!isFinite(ratio) || ratio <= 0) {
+      const s = quadSize([tl, tr, br, bl]);
+      ratio = s.h / s.w;
+      method = 'edges';
+    }
+    // Snap to a standard paper size when close (either orientation).
+    const tolerance = method === 'perspective' ? 0.05 : 0.08;
+    for (const p of PAPER_RATIOS) {
+      for (const r of [p.r, 1 / p.r]) {
+        if (Math.abs(ratio - r) / r < tolerance) return { ratio: r, focal, method: method + '→' + p.name };
+      }
+    }
+    return { ratio, focal, method };
+  }
+
+  /** Fraction of the page's interior (the quad shrunk by `shrink`) covered by a mask. */
+  function maskCoverage(quad, mask, w, h, shrink = 0.15) {
+    const q = inset(orderCorners(quad), shrink);
+    const xs = q.map(p => p.x), ys = q.map(p => p.y);
+    let n = 0, hit = 0;
+    for (let y = Math.max(0, Math.floor(Math.min(...ys))); y <= Math.min(h - 1, Math.ceil(Math.max(...ys))); y += 2) {
+      for (let x = Math.max(0, Math.floor(Math.min(...xs))); x <= Math.min(w - 1, Math.ceil(Math.max(...xs))); x += 2) {
+        let inside = true;
+        for (let k = 0; k < 4 && inside; k++) {
+          const a = q[k], b = q[(k + 1) % 4];
+          if ((b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x) < 0) inside = false;
+        }
+        if (!inside) continue;
+        n++;
+        if (mask[y * w + x]) hit++;
+      }
+    }
+    return n ? hit / n : 0;
+  }
+
+  /** Downscales a canvas/video/bitmap to `width` px wide, halving first when shrinking a lot (avoids aliasing). */
+  function shrinkTo(source, width) {
+    const sw = source.videoWidth || source.width, sh = source.videoHeight || source.height;
+    const height = Math.round(sh * width / sw);
+    let src = source, cw = sw;
+    while (cw > width * 2.5) {
+      const half = createCanvas(Math.round(cw / 2), Math.round(sh * (cw / 2) / sw));
+      const hctx = half.getContext('2d');
+      hctx.imageSmoothingQuality = 'high';
+      hctx.drawImage(src, 0, 0, half.width, half.height);
+      src = half;
+      cw = half.width;
+    }
+    const out = createCanvas(width, height);
+    const octx = ctx2d(out);
+    octx.imageSmoothingQuality = 'high';
+    octx.drawImage(src, 0, 0, width, height);
+    return octx.getImageData(0, 0, width, height);
+  }
+
+  /**
+   * Full pipeline for one image (uploads, the evaluation harness): detect at
+   * 480 px, refine at ~960 px, then refine again at full resolution.
+   * @returns {{ corners, touchesEdge, support } | null}  corners in source pixels
+   */
+  function locatePage(source, opts = {}) {
+    const sw = source.videoWidth || source.width, sh = source.videoHeight || source.height;
+    const small = shrinkTo(source, Math.min(480, sw));
+    const det = detectQuad(small, opts);
+    if (!det) return null;
+    let quad = det.map(p => ({ x: p.x * sw / small.width, y: p.y * sh / small.height }));
+    let support = det.support;
+    const levels = sw > 1200 ? [960, sw] : [sw];
+    for (const lw of levels) {
+      const img = lw === sw ? (() => { const c = createCanvas(sw, sh); const x = ctx2d(c); x.drawImage(source, 0, 0); return x.getImageData(0, 0, sw, sh); })() : shrinkTo(source, lw);
+      const s = img.width / sw;
+      const r = refineQuad(img, quad.map(p => ({ x: p.x * s, y: p.y * s })), { hand: opts.hand, band: Math.sqrt(polygonArea(quad)) * s * (lw === sw ? 0.015 : 0.025) });
+      quad = r.quad.map(p => ({ x: p.x / s, y: p.y / s }));
+      support = r.support;
+    }
+    return { corners: quad, touchesEdge: det.touchesEdge, support };
+  }
+
   /**
    * Finds the page in a frame. Candidates come from two places: regions that
    * look like paper (bright, colourless, not skin), and outlines found by Canny
@@ -644,12 +973,17 @@ const Vision = (() => {
    * Returns 4 ordered corners in the image's pixel coordinates (with
    * `touchesEdge` set when the page runs off the frame), or null.
    */
-  function detectQuad(imageData, minAreaRatio = 0.08, debug = null) {
+  function detectQuad(imageData, opts = {}) {
+    const { minAreaRatio = 0.04, debug = null, prior = null, hand = null } = opts;
     const cv = window.cv;
     if (!cv || !cv.Mat) return null;
     const w = imageData.width, h = imageData.height;
     const frameArea = w * h;
     const skin = skinMask(imageData);
+    // A hand mask from the hand tracker (when available) joins the skin mask.
+    if (hand && hand.width === w && hand.height === h) {
+      for (let i = 0; i < frameArea; i++) if (hand.mask[i]) { if (!skin.mask[i]) skin.count++; skin.mask[i] = 1; }
+    }
     const skinUsable = skin.count < frameArea * 0.4;
     const noSkin = new Uint8Array(frameArea);
     const paper = paperMask(imageData, skinUsable ? skin.mask : noSkin);
@@ -682,14 +1016,19 @@ const Vision = (() => {
         cv.morphologyEx(region, region, cv.MORPH_OPEN, openK);
         const regionContours = track(new cv.MatVector());
         const hier = track(new cv.Mat());
-        cv.findContours(region, regionContours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        cv.findContours(region, regionContours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE);
         for (let i = 0; i < regionContours.size(); i++) {
           const c = regionContours.get(i);
           if (cv.contourArea(c) >= frameArea * minAreaRatio * 0.6) {
+            const unpad = q => q && q.map(p => ({ x: Math.min(w - 1, Math.max(0, p.x - pad)), y: Math.min(h - 1, Math.max(0, p.y - pad)) }));
+            const shifted = c.clone(); // contour in unpadded coordinates, for the line fit
+            const sd = shifted.data32S;
+            for (let k = 0; k < sd.length; k++) sd[k] -= pad;
+            consider(quadFromContour(cv, shifted, skinUsable ? skin.mask : null, w, h));
+            shifted.delete();
             const hull = new cv.Mat();
             cv.convexHull(c, hull); // the hull fills the notches left by thumbs
-            const q = quadFromHull(cv, hull);
-            consider(q && q.map(p => ({ x: Math.min(w - 1, Math.max(0, p.x - pad)), y: Math.min(h - 1, Math.max(0, p.y - pad)) })));
+            consider(unpad(quadFromHull(cv, hull)));
             hull.delete();
           }
           c.delete();
@@ -731,11 +1070,33 @@ const Vision = (() => {
     } finally {
       mats.forEach(m => m.delete());
     }
+    // 4. The previous frame's page, re-checked on this frame (temporal prior, as in SmartDoc's best entries).
+    if (prior) consider(prior.map(p => ({ x: p.x, y: p.y })));
 
-    let best = null;
+    const handInfo = { mask: skinUsable ? skin.mask : noSkin, width: w, height: h };
     const scored = candidates.map(c => scoreQuad(c.pts, c.mask || paper.strict, paper.Y, ink, w, h));
-    for (const s of scored) {
-      if (s.score > 0 && (!best || s.score > best.score)) best = s;
+    // Re-rank the top candidates by edge support after snapping them to the page edges (Tropin et al.).
+    const top = scored.map((s, i) => ({ s, i })).filter(x => x.s.score > 0)
+      .sort((a, b) => b.s.score - a.s.score).slice(0, 4);
+    const diag = Math.hypot(w, h);
+    let best = null;
+    for (const { s } of top) {
+      const r = refineQuad(imageData, s.quad, { hand: handInfo });
+      s.quad = r.quad;
+      s.support = r.support;
+      s.meanSupport = r.meanSupport;
+      let score = s.score * (0.4 + 0.6 * r.meanSupport);
+      if (prior) {
+        const pq = orderCorners(prior);
+        const dMean = s.quad.reduce((acc, p, k) => acc + dist(p, pq[k]), 0) / 4;
+        if (dMean < diag * 0.05) score *= 1.3; // agrees with the previous frame
+      }
+      s.finalScore = score;
+      if (!best || score > best.finalScore) best = s;
+    }
+    if (best) {
+      const edge = Math.max(1.5, Math.min(w, h) * 0.004);
+      best.touchesEdge = best.touchesEdge || best.quad.some(p => p.x <= edge || p.y <= edge || p.x >= w - 1 - edge || p.y >= h - 1 - edge);
     }
     if (debug) {
       debug.width = w;
@@ -748,8 +1109,9 @@ const Vision = (() => {
       debug.best = best;
     }
     if (!best) return null;
-    const quad = inset(best.quad, 0.012);
+    const quad = best.quad.map(p => ({ x: p.x, y: p.y }));
     quad.touchesEdge = best.touchesEdge;
+    quad.support = best.support;
     return quad;
   }
 
@@ -761,7 +1123,20 @@ const Vision = (() => {
   }
 
   /** Rejects slivers and badly distorted shapes. */
+  function isConvex(q) {
+    let sign = 0;
+    for (let i = 0; i < 4; i++) {
+      const a = q[i], b = q[(i + 1) % 4], c = q[(i + 2) % 4];
+      const z = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+      if (Math.abs(z) < 1e-6) return false;
+      if (sign && Math.sign(z) !== sign) return false;
+      sign = Math.sign(z);
+    }
+    return true;
+  }
+
   function looksLikePage(pts) {
+    if (!isConvex(orderCorners(pts))) return false;
     const [a, b, c, d] = orderCorners(pts);
     const top = dist(a, b), bottom = dist(d, c), left = dist(a, d), right = dist(b, c);
     const ratio = Math.min(top, bottom, left, right) / Math.max(top, bottom, left, right);
@@ -804,8 +1179,13 @@ const Vision = (() => {
    * Cuts the quad out of the source and flattens it into a rectangle.
    * @param {HTMLCanvasElement|ImageBitmap} source
    */
-  function warp(source, corners, maxDim) {
+  function warp(source, corners, maxDim, aspect) {
     let { w, h } = quadSize(corners);
+    if (aspect) {
+      // Keep the true page shape; size so each source pixel maps to at least one output pixel.
+      w = Math.max(w, h / aspect);
+      h = w * aspect;
+    }
     let scale = Math.min(1, maxDim / Math.max(w, h));
 
     // Let the browser downscale first (better quality than point sampling).
@@ -960,6 +1340,7 @@ const Vision = (() => {
   return {
     createCanvas, ctx2d, orderCorners, fullFrame, polygonArea,
     toGray, meanAbsDiff, sharpness,
-    detectQuad, warp, rotate, applyFilter, quadSize, removeFingers
+    detectQuad, warp, rotate, applyFilter, quadSize, removeFingers,
+    refineQuad, estimateAspect, maskCoverage, locatePage, shrinkTo, inset, skinMask
   };
 })();
