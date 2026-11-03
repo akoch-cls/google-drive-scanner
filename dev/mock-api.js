@@ -91,7 +91,11 @@ const ScannerAPI = (() => {
       return { courseId: params.courseId, itemId, itemType: params.itemType || 'courseWork', attachmentId: params.attachmentId || '', addOnToken: params.addOnToken || '', submissionId: params.submissionId || '' };
     },
     createAddOnAttachment: (ctx, title) => later(() => { window.__lastAttachment = { ctx, title }; return { id: 'att1', title }; }),
-    getAddOnInfo: () => later(() => ({ isStudent: !asTeacher, isTeacher: asTeacher, submissionId: asTeacher ? '' : 'sub-me', title: 'Scan your work', itemTitle: 'Lab report: Osmosis' })),
+    // ?wrongAccount: Classroom refuses, as when the student signed in with another account.
+    getAddOnInfo: () => later(() => /[?&]wrongAccount/.test(location.search) ? (() => {
+      const e = new Error('You are signed in as student@example.org, but Classroom is using another account. Sign out, then sign in with the account you use for Classroom.');
+      e.code = 'wrong_account'; throw e;
+    })() : ({ isStudent: !asTeacher, isTeacher: asTeacher, submissionId: asTeacher ? '' : 'sub-me', title: 'Scan your work', itemTitle: 'Lab report: Osmosis' })),
     getMyAddOnScan: (ctx, sub) => later(() => addOnScans.find(f => f.submissionId === sub) || null),
     submitAddOnScan: async req => {
       window.__lastAddOnSubmit = req;

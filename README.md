@@ -74,7 +74,7 @@ Ask your admin to check these if sign-in fails or Classroom shows errors:
 | See and turn in your Classroom work (`classroom.coursework.me`) | List assignments, attach the PDF, turn in |
 | Manage coursework for your students (`classroom.coursework.students`) | Teachers only: requested the first time a teacher creates a scan assignment |
 | Classroom add-on permissions (`classroom.addons.student`, `classroom.addons.teacher`) | Add-on only: attach the scanner to an assignment, and know whose submission a scan belongs to |
-| See class rosters and their email addresses (`classroom.rosters.readonly`, `classroom.profile.emails`) | Add-on only, students: share their scan with the class's teachers |
+| See class rosters and their email addresses (`classroom.rosters.readonly`, `classroom.profile.emails`) | Add-on only. Students: find their teachers' emails to share the scan with them. Teachers: check each scan really belongs to the student it's filed under. These also let a student see classmates' emails, which Classroom already shows them on the People page |
 
 Sign-ins last about an hour per browser tab. After that, clicking Save asks again; there's normally no password to retype.
 
@@ -114,15 +114,22 @@ with the same push.
 
 1. They open the assignment in Classroom and click the **Scan your work** attachment.
 2. The scanner opens inside Classroom. They scan and click **Submit to Classroom**. The first time, Google asks for permission.
-3. The PDF goes to their Drive (`Scanned Assignments`), shared view-only with the class's teachers. If they scan again, the new PDF replaces the old one.
+3. The PDF goes to their Drive (`Scanned Assignments`), shared view-only with each of the class's teachers (and the class's
+   teacher group, if Classroom provides it). If they scan again for the same attachment, the new PDF replaces the old one.
 4. They click Classroom's own **Turn in** button. Add-ons can't turn work in themselves; Classroom keeps that button.
 
 If Classroom doesn't let the scanner use the camera inside the assignment, it says so and offers **Open in a new tab**.
-The scan still goes to the same assignment. There's also an **Open in new tab ↗** button for a bigger view.
+The scan still goes to the same assignment. There's also an **Open in new tab ↗** button for a bigger view. The new
+tab asks the student to sign in again (sign-ins are kept per tab).
+
+If the student signs in with a different Google account from the one Classroom is using, the scanner says so
+instead of submitting.
 
 Teachers see the scan in Classroom's grading view (the student work review pane) and on the attachment itself.
-Nothing extra is stored anywhere: the student's Drive holds the file, and the scan is linked to the assignment by
-private app properties that only this app can read.
+Nothing extra is stored anywhere: the student's Drive holds the file, tagged with the class, assignment, attachment
+and submission it belongs to. Those tags only say what a file *claims* to be, since anyone using the app could set
+them. So before showing a scan, the teacher pages check with Classroom that the file's owner is the student who
+owns that submission. A file shared by anyone else is ignored.
 
 ### Setting it up
 
@@ -161,9 +168,12 @@ These can't be tested outside a real Classroom domain:
   doesn't, students get the "Open in a new tab" button; the flow still works, with one extra click.
 - **Sign-in inside Classroom.** Google's sign-in pop-up opens from the frame. If the browser blocks pop-ups,
   students need to allow them for the site once.
-- **Sharing with teachers.** The scan is shared with the class's teacher group, or with each teacher's email if
-  Classroom doesn't give students the group. A co-teacher added later won't see scans submitted before they joined
-  until the student scans again.
+- **Sharing with teachers.** Each scan is shared with every teacher's email, plus the class's teacher group when
+  Classroom gives students that address. The submit fails with a clear message only if every share fails (for
+  example, a Drive sharing policy). Without the group, a co-teacher added later won't see earlier scans until the
+  student scans again.
+- **Roster emails.** The teacher pages need Classroom to return students' email addresses (`classroom.profile.emails`)
+  to check who owns each scan. If your admin settings hide them, the teacher pages show no scans.
 
 ## Tips for good scans
 

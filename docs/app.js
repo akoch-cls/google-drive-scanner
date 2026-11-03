@@ -272,6 +272,7 @@
   async function startCamera(deviceId) {
     stopCamera();
     el.cameraError.classList.add('hidden');
+    el.openTab.classList.add('hidden');
     setStatus('Starting camera…', '');
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       showCameraError('Camera not supported', "This browser can't use the camera here. You can still upload photos.");
@@ -1563,7 +1564,8 @@
 
       if (state.saveTab === 'addon') {
         const addon = state.addon;
-        if (!addon.info) await refreshAddOn(true);
+        // Always ask Classroom again: the account may have changed since the page loaded.
+        await refreshAddOn(true);
         const res = await server('submitAddOnScan', {
           name, pages, onProgress, context: addon.ctx, submissionId: addon.info.submissionId
         });
@@ -1697,7 +1699,7 @@
   }
 
   function setAddOn(ctx) {
-    state.addon = { ctx, framed: isFramed(), info: null, existing: null };
+    state.addon = { ctx, framed: isFramed(), info: null, existing: null, problem: '' };
     document.body.classList.add('addon');
     el.targetClear.classList.add('hidden');
     el.targetTitle.textContent = 'this assignment';
@@ -1711,24 +1713,40 @@
   /** Asks Classroom who's looking and whether they've already submitted a scan. */
   async function refreshAddOn(strict) {
     const addon = state.addon;
+    addon.info = null;
+    addon.existing = null;
+    addon.problem = '';
     try {
-      addon.info = await server('getAddOnInfo', addon.ctx);
-      if (!addon.info.isStudent) {
-        addon.info = null;
+      const info = await server('getAddOnInfo', addon.ctx);
+      if (!info.isStudent) {
         throw new Error('Only students can submit scans here. Teachers see submissions in the student work view.');
       }
-      addon.existing = await server('getMyAddOnScan', addon.ctx, addon.info.submissionId).catch(() => null);
-      renderAddOnBanner();
+      addon.info = info;
+      addon.existing = await server('getMyAddOnScan', addon.ctx, info.submissionId).catch(() => null);
     } catch (err) {
+      addon.problem = friendlyError(err);
       if (strict) throw err;
+    } finally {
+      renderAddOnBanner();
     }
+  }
+
+  /** Forgets everything about the previous account (shared devices). */
+  function resetAddOn() {
+    const addon = state.addon;
+    addon.info = null;
+    addon.existing = null;
+    addon.problem = '';
+    renderAddOnBanner();
   }
 
   function renderAddOnBanner() {
     const addon = state.addon;
     const info = addon.info || {};
     el.targetTitle.textContent = info.itemTitle || info.title || 'this assignment';
-    el.targetCourse.innerHTML = addon.existing
+    el.targetCourse.innerHTML = addon.problem
+      ? '· <span class="banner-warn">' + esc(addon.problem) + '</span>'
+      : addon.existing
       ? '· Submitted: <a href="' + esc(addon.existing.url) + '" target="_blank" rel="noopener">' + esc(addon.existing.name) +
         '</a>. Scan again to replace it.'
       : '';
@@ -1897,6 +1915,7 @@
     api.signOut();
     state.cls = { courses: null, error: null, courseId: null, assignments: {}, selected: null, target: state.cls.target };
     state.teacher = { courses: null, work: {} };
+    if (state.addon) resetAddOn();
     el.teacherBtn.classList.add('hidden');
     toast('Signed out');
   });

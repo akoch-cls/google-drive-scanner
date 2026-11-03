@@ -31,18 +31,23 @@ const ScannerAPI = (() => {
   ];
   // Only requested when a teacher creates an assignment.
   const TEACHER_SCOPES = ['https://www.googleapis.com/auth/classroom.coursework.students'];
-  // Only requested inside the Classroom add-on. Students also need to look up
-  // their teachers, to share the scan with them.
-  const ADDON_STUDENT_SCOPES = [
-    'https://www.googleapis.com/auth/classroom.addons.student',
+  // Only requested inside the Classroom add-on. The roster scopes let a student
+  // look up their teachers' emails (to share the scan with them) and let a
+  // teacher check that each scan really belongs to the student it claims to.
+  const ROSTER_SCOPES = [
     'https://www.googleapis.com/auth/classroom.rosters.readonly',
     'https://www.googleapis.com/auth/classroom.profile.emails'
   ];
-  const ADDON_TEACHER_SCOPES = ['https://www.googleapis.com/auth/classroom.addons.teacher'];
+  const ADDON_STUDENT_SCOPES = ['https://www.googleapis.com/auth/classroom.addons.student'].concat(ROSTER_SCOPES);
+  const ADDON_TEACHER_SCOPES = [
+    'https://www.googleapis.com/auth/classroom.addons.teacher',
+    'https://www.googleapis.com/auth/classroom.coursework.students'
+  ].concat(ROSTER_SCOPES);
 
   let token = loadToken();     // { access_token, expires_at, scope }
   let client = null;
   let email = token && token.email || '';
+  let userId = token && token.sub || '';   // Google account ID of the signed-in user
   let rootId = null;
   let loginHint = '';          // Classroom passes the signed-in user as login_hint
   const listeners = [];
@@ -129,8 +134,10 @@ const ScannerAPI = (() => {
         try {
           const me = await request('https://www.googleapis.com/oauth2/v3/userinfo');
           email = me.email || '';
+          userId = me.sub || '';
         } catch (err) { /* email is only for display */ }
         t.email = email;
+        t.sub = userId;
         saveToken(t);
         resolve(email);
       };
@@ -139,7 +146,7 @@ const ScannerAPI = (() => {
           : err && err.type === 'popup_failed_to_open' ? 'Your browser blocked the Google sign-in pop-up. Allow pop-ups for this site and try again.'
             : 'Google sign-in failed.'));
       };
-      client.requestAccessToken({ scope: needed.join(' '), hint: email || loginHint || undefined, prompt: '' });
+      client.requestAccessToken({ scope: needed.join(' '), hint: loginHint || email || undefined, prompt: '' });
     });
   }
 
@@ -147,6 +154,7 @@ const ScannerAPI = (() => {
     const t = token;
     saveToken(null);
     email = '';
+    userId = '';
     if (t && window.google && google.accounts && google.accounts.oauth2) {
       google.accounts.oauth2.revoke(t.access_token, () => {});
     }
@@ -619,7 +627,12 @@ const ScannerAPI = (() => {
   // with the class's teachers, so the teacher's review pane can find it.
   // ---------------------------------------------------------------------------
 
-  const ITEM_COLLECTIONS = { courseWork: 'courseWork', courseWorkMaterial: 'courseWorkMaterials', announcement: 'announcements' };
+  // Classroom's itemType values (both the documented plural and singular forms).
+  const ITEM_COLLECTIONS = {
+    courseWork: 'courseWork',
+    courseWorkMaterials: 'courseWorkMaterials', courseWorkMaterial: 'courseWorkMaterials',
+    announcements: 'announcements', announcement: 'announcements'
+  };
 
   /** Reads Classroom's query parameters. Returns null outside the add-on. */
   function addOnContext(params) {
@@ -665,12 +678,27 @@ const ScannerAPI = (() => {
     });
   }
 
-  /** Who's looking (student: their submission id) and what the attachment is called. */
+  /**
+   * Who's looking (student: their submission id) and what the attachment is
+   * called. If Classroom refuses and the signed-in account isn't the one
+   * Classroom is using, says so instead of showing a permission error.
+   */
   async function getAddOnInfo(ctx) {
-    const [context, attachment] = await Promise.all([
-      request(itemBase(ctx) + '/addOnContext', { query: { attachmentId: ctx.attachmentId, addOnToken: ctx.addOnToken || undefined } }),
-      request(itemBase(ctx) + '/addOnAttachments/' + encodeURIComponent(ctx.attachmentId)).catch(() => ({}))
-    ]);
+    let context;
+    try {
+      context = await request(itemBase(ctx) + '/addOnContext', {
+        query: { attachmentId: ctx.attachmentId, addOnToken: ctx.addOnToken || undefined }
+      });
+    } catch (err) {
+      if (err.code !== 'auth' && isOtherAccount()) {
+        const e = new Error('You are signed in as ' + (email || 'a different account') +
+          ', but Classroom is using another account. Sign out, then sign in with the account you use for Classroom.');
+        e.code = 'wrong_account';
+        throw e;
+      }
+      throw err;
+    }
+    const attachment = await request(itemBase(ctx) + '/addOnAttachments/' + encodeURIComponent(ctx.attachmentId)).catch(() => ({}));
     let itemTitle = '';
     try {
       const work = await request(itemBase(ctx), { query: { fields: 'title' } });
@@ -685,6 +713,11 @@ const ScannerAPI = (() => {
     };
   }
 
+  /** Classroom's login_hint is the Google account ID it's using; compare it with ours. */
+  function isOtherAccount() {
+    return !!(loginHint && userId && /^\d+$/.test(loginHint) && loginHint !== userId);
+  }
+
   const scanFields = 'files(id,name,webViewLink,modifiedTime,owners(displayName,emailAddress),appProperties)';
 
   function scanFile(f) {
@@ -694,76 +727,146 @@ const ScannerAPI = (() => {
       url: f.webViewLink || 'https://drive.google.com/file/d/' + f.id + '/view',
       preview: 'https://drive.google.com/file/d/' + f.id + '/preview',
       student: owner.displayName || owner.emailAddress || '',
-      studentEmail: owner.emailAddress || '',
+      studentEmail: (owner.emailAddress || '').toLowerCase(),
       submissionId: f.appProperties && f.appProperties.scanSubmission || ''
     };
   }
 
-  async function findScans(key, value, mineOnly) {
-    const q = "appProperties has { key='" + key + "' and value=" + quote(value) + ' } and trashed = false' +
-      (mineOnly ? " and 'me' in owners" : '');
+  /**
+   * Drive files tagged by the add-on that match every key/value in `props`.
+   * The tags only say what a file claims to be: anyone using this app can set
+   * them, so teachers' views check each file's owner against Classroom.
+   */
+  async function findScans(props, mineOnly) {
+    const q = Object.keys(props).map(k => "appProperties has { key='" + k + "' and value=" + quote(props[k]) + ' }')
+      .concat(['trashed = false'], mineOnly ? ["'me' in owners"] : []).join(' and ');
     const res = await request(DRIVE + '/files', {
       query: { q, fields: scanFields, orderBy: 'modifiedTime desc', pageSize: 1000, supportsAllDrives: true, includeItemsFromAllDrives: true }
     });
     return (res.files || []).map(scanFile);
   }
 
+  const attachmentProps = ctx => ({ scanCourse: ctx.courseId, scanItem: ctx.itemId, scanAttachment: ctx.attachmentId });
+
   /** Student: the scan they've already submitted for this attachment, if any. */
   async function getMyAddOnScan(ctx, submissionId) {
-    const files = await findScans('scanSubmission', submissionId, true);
-    return files.find(f => f.submissionId === submissionId) || null;
-  }
-
-  /** Teacher: every student's scan for this attachment, newest first. */
-  async function listAddOnScans(ctx) {
-    return findScans('scanAttachment', ctx.attachmentId, false);
-  }
-
-  /** Teacher: one student's scan (the student work review iframe). */
-  async function getAddOnScanForSubmission(ctx) {
-    const files = await findScans('scanSubmission', ctx.submissionId, false);
+    const files = await findScans(Object.assign(attachmentProps(ctx), { scanSubmission: submissionId }), true);
     return files[0] || null;
   }
 
-  /** Who to share a student's scan with: the course's teacher group, else each teacher. */
-  async function teacherShareTargets(courseId) {
+  /** Teacher: emails of the course's students, by Classroom user ID. */
+  async function studentEmails(courseId) {
+    const students = await listAll(CLASSROOM + '/courses/' + encodeURIComponent(courseId) + '/students',
+      { pageSize: 100 }, 'students', 2000);
+    const out = {};
+    students.forEach(s => {
+      const mail = s.profile && s.profile.emailAddress;
+      if (mail) out[s.userId] = mail.toLowerCase();
+    });
+    return out;
+  }
+
+  /**
+   * Keeps only scans owned by the student whose submission they're tagged with,
+   * and only the newest one per submission. `subs` maps submission ID → user ID.
+   */
+  function verifiedScans(files, subs, emails) {
+    const seen = {};
+    return files.filter(f => {
+      const owner = emails[subs[f.submissionId]];
+      if (!owner || owner !== f.studentEmail || seen[f.submissionId]) return false;
+      seen[f.submissionId] = true;
+      return true;
+    });
+  }
+
+  function submissionsBase(ctx) {
+    return CLASSROOM + '/courses/' + encodeURIComponent(ctx.courseId) + '/courseWork/' +
+      encodeURIComponent(ctx.itemId) + '/studentSubmissions';
+  }
+
+  /** Teacher: each student's scan for this attachment (verified), newest first. */
+  async function listAddOnScans(ctx) {
+    const [files, subs, emails] = await Promise.all([
+      findScans(attachmentProps(ctx), false),
+      listAll(submissionsBase(ctx), { pageSize: 100 }, 'studentSubmissions', 5000),
+      studentEmails(ctx.courseId)
+    ]);
+    const byId = {};
+    subs.forEach(s => { byId[s.id] = s.userId; });
+    return verifiedScans(files, byId, emails);
+  }
+
+  /** Teacher: one student's scan (the student work review iframe), verified. */
+  async function getAddOnScanForSubmission(ctx) {
+    const [files, sub] = await Promise.all([
+      findScans(Object.assign(attachmentProps(ctx), { scanSubmission: ctx.submissionId }), false),
+      request(submissionsBase(ctx) + '/' + encodeURIComponent(ctx.submissionId))
+    ]);
+    const student = await request(CLASSROOM + '/courses/' + encodeURIComponent(ctx.courseId) + '/students/' +
+      encodeURIComponent(sub.userId));
+    const mail = (student.profile && student.profile.emailAddress || '').toLowerCase();
+    return verifiedScans(files, { [ctx.submissionId]: sub.userId }, { [sub.userId]: mail })[0] || null;
+  }
+
+  /**
+   * Shares a scan read-only with the course's teachers: each teacher by email
+   * (files shared with a group don't reliably show up in its members' Drive
+   * searches), plus the course's teacher group when Classroom provides it, so
+   * teachers who join later can open it too. At least one share must work.
+   */
+  async function shareWithTeachers(fileId, courseId) {
+    const share = body => request(DRIVE + '/files/' + encodeURIComponent(fileId) + '/permissions', {
+      method: 'POST',
+      query: { sendNotificationEmail: false, supportsAllDrives: true },
+      body: Object.assign({ role: 'reader' }, body)
+    });
+    let shared = 0;
+    let lastError = null;
+    let teachers = [];
+    try {
+      teachers = await listAll(CLASSROOM + '/courses/' + encodeURIComponent(courseId) + '/teachers',
+        { pageSize: 100 }, 'teachers', 100);
+    } catch (err) { lastError = err; }
+    for (const t of teachers) {
+      const mail = t.profile && t.profile.emailAddress;
+      if (!mail) continue;
+      try { await share({ type: 'user', emailAddress: mail }); shared++; } catch (err) { lastError = err; }
+    }
     try {
       const course = await request(CLASSROOM + '/courses/' + encodeURIComponent(courseId), { query: { fields: 'teacherGroupEmail' } });
-      if (course.teacherGroupEmail) return [{ type: 'group', emailAddress: course.teacherGroupEmail }];
-    } catch (err) { /* fall back to the teacher list */ }
-    const teachers = await listAll(CLASSROOM + '/courses/' + encodeURIComponent(courseId) + '/teachers',
-      { pageSize: 100 }, 'teachers', 100);
-    return teachers
-      .map(t => t.profile && t.profile.emailAddress)
-      .filter(Boolean)
-      .map(emailAddress => ({ type: 'user', emailAddress }));
+      if (course.teacherGroupEmail) { await share({ type: 'group', emailAddress: course.teacherGroupEmail }); shared++; }
+    } catch (err) { lastError = lastError || err; }
+    if (!shared) {
+      if (lastError && lastError.code === 'auth') throw lastError;
+      throw new Error("Couldn't share your scan with your teacher" +
+        (lastError ? ' (' + lastError.message + ')' : '') + '. Ask your teacher or school admin to check Drive sharing settings.');
+    }
   }
 
   /**
    * Student: uploads the scan, shares it with the teachers (read-only) and
-   * replaces any earlier scan for the same submission. Turning in happens with
+   * replaces any earlier scan for the same attachment. Turning in happens with
    * Classroom's own Turn in button.
    */
   async function submitAddOnScan(req) {
     const ctx = req.context;
     if (!req.submissionId) throw new Error("Classroom didn't say which submission is yours. Open the assignment from Classroom and try again.");
-    const targets = await teacherShareTargets(ctx.courseId);
-    if (!targets.length) throw new Error("Couldn't find this class's teachers to share your scan with.");
-    const earlier = await findScans('scanSubmission', req.submissionId, true);
+    const props = Object.assign(attachmentProps(ctx), { scanSubmission: req.submissionId });
+    const earlier = await findScans(props, true);
     const folder = await findOrCreateFolder(CLASSROOM_FOLDER_NAME);
     const file = await uploadPdf(folder.id, req.name, req.pages, req.onProgress, {
       description: 'Scanned with Doc Scanner for Google Classroom.',
-      appProperties: {
-        scanCourse: ctx.courseId, scanItem: ctx.itemId,
-        scanAttachment: ctx.attachmentId, scanSubmission: req.submissionId
-      }
+      appProperties: props
     });
-    for (const t of targets) {
-      await request(DRIVE + '/files/' + encodeURIComponent(file.id) + '/permissions', {
-        method: 'POST',
-        query: { sendNotificationEmail: false, supportsAllDrives: true },
-        body: Object.assign({ role: 'reader' }, t)
-      });
+    try {
+      await shareWithTeachers(file.id, ctx.courseId);
+    } catch (err) {
+      // Don't leave an unshared copy behind; the earlier scan (if any) stays.
+      await request(DRIVE + '/files/' + encodeURIComponent(file.id), {
+        method: 'PATCH', query: { supportsAllDrives: true }, body: { trashed: true }
+      }).catch(() => {});
+      throw err;
     }
     await Promise.all(earlier.map(f => request(DRIVE + '/files/' + encodeURIComponent(f.id), {
       method: 'PATCH', query: { supportsAllDrives: true }, body: { trashed: true }
