@@ -27,6 +27,11 @@ const ScannerAPI = (() => {
   };
   const listeners = [];
   let signedIn = false;
+  // Add-on: ?asTeacher in the URL makes the mock user a teacher.
+  const asTeacher = /[?&]asTeacher/.test(location.search);
+  const addOnScans = [
+    { id: 'p1', name: 'Lab report.pdf', modified: soon(-0.1), url: '#', preview: 'about:blank', student: 'Ada Student', studentEmail: 'ada@example.org', submissionId: 'sub-ada' }
+  ];
   const later = (fn, ms = 300) => new Promise((resolve, reject) => setTimeout(() => {
     try { resolve(fn()); } catch (err) { reject(err); }
   }, ms));
@@ -35,7 +40,7 @@ const ScannerAPI = (() => {
   };
 
   return {
-    TEACHER_SCOPES: [],
+    TEACHER_SCOPES: [], ADDON_STUDENT_SCOPES: [], ADDON_TEACHER_SCOPES: [],
     isConfigured: () => true,
     isSignedIn: () => signedIn,
     ensureSignedIn: () => {
@@ -79,6 +84,26 @@ const ScannerAPI = (() => {
     },
     getTeachingCourses: () => later(() => [{ id: 't1', name: 'Biology', section: 'Period 3' }]),
     getCourseWorkForTeacher: () => later(() => [{ id: 'w9', title: 'Homework 4', oneClick: false, scanLink: location.origin + '/?course=t1&assignment=w9' }]),
-    createScanAssignment: req => later(() => ({ id: 'w10', title: req.title, link: 'https://classroom.google.com', scanLink: location.origin + '/?course=t1&assignment=w10' }))
+    createScanAssignment: req => later(() => ({ id: 'w10', title: req.title, link: 'https://classroom.google.com', scanLink: location.origin + '/?course=t1&assignment=w10' })),
+    addOnContext: params => {
+      const itemId = params.itemId || params.postId;
+      if (!params.courseId || !itemId) return null;
+      return { courseId: params.courseId, itemId, itemType: params.itemType || 'courseWork', attachmentId: params.attachmentId || '', addOnToken: params.addOnToken || '', submissionId: params.submissionId || '' };
+    },
+    createAddOnAttachment: (ctx, title) => later(() => { window.__lastAttachment = { ctx, title }; return { id: 'att1', title }; }),
+    getAddOnInfo: () => later(() => ({ isStudent: !asTeacher, isTeacher: asTeacher, submissionId: asTeacher ? '' : 'sub-me', title: 'Scan your work', itemTitle: 'Lab report: Osmosis' })),
+    getMyAddOnScan: (ctx, sub) => later(() => addOnScans.find(f => f.submissionId === sub) || null),
+    submitAddOnScan: async req => {
+      window.__lastAddOnSubmit = req;
+      await progress(req.onProgress);
+      const replaced = addOnScans.filter(f => f.submissionId === req.submissionId).length;
+      const file = { id: 'p' + Date.now(), name: req.name + '.pdf', modified: new Date().toISOString(), url: '#', preview: 'about:blank', student: 'Me Student', submissionId: req.submissionId };
+      for (let i = addOnScans.length - 1; i >= 0; i--) if (addOnScans[i].submissionId === req.submissionId) addOnScans.splice(i, 1);
+      addOnScans.unshift(file);
+      return { file, replaced };
+    },
+    listAddOnScans: () => later(() => addOnScans.slice()),
+    getAddOnScanForSubmission: ctx => later(() => addOnScans.find(f => f.submissionId === ctx.submissionId) || null),
+    closeAddOnIframe: () => { window.__closed = true; }
   };
 })();

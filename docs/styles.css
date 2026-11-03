@@ -396,3 +396,27 @@
     .controls .control-group.right { grid-column: 1 / -1; justify-content: center; }
     #cvStatus, .account-email { display: none; }
   }
+
+  /* ---------- Classroom add-on ---------- */
+  body.addon .topbar { height: 48px; padding: 0 12px; }
+  body.addon .brand { font-size: 16px; }
+  body.addon .target-banner { padding: 8px 12px; }
+  body.addon .target-banner a { color: var(--accent); }
+  body.addon-page { overflow: auto; }
+  .addon-main { flex: 1; display: flex; flex-direction: column; align-items: center; padding: 24px 16px; gap: 16px; position: relative; }
+  .addon-card {
+    width: 100%; max-width: 520px; display: flex; flex-direction: column; gap: 14px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px;
+  }
+  .addon-card.wide { max-width: 760px; }
+  .addon-card h2 { margin: 0; font-size: 18px; }
+  .addon-card p { margin: 0; }
+  .addon-card .btn.primary { align-self: flex-start; }
+  .row.between { justify-content: space-between; }
+  .scan-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  .scan-list li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
+  .scan-list li.empty { justify-content: center; padding: 24px; }
+  .addon-review { width: 100%; flex: 1; display: flex; flex-direction: column; gap: 10px; min-height: 70vh; }
+  .review-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .addon-review iframe { flex: 1; width: 100%; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+  .addon-busy { position: absolute; inset: 0; display: grid; place-items: center; background: color-mix(in srgb, var(--bg) 60%, transparent); }

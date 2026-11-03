@@ -20,6 +20,7 @@ browser, and people sign in with their own Google account, so scans go to their 
 - **Quick folder picking.** Your last folder is preselected and recent folders are one click away. You can also browse My Drive and **shared drives**, search all of Drive, or create a folder without leaving the dialog.
 - **Google Classroom turn in.** Pick a class and assignment and the PDF is attached and turned in. See [Classroom: what works how](#classroom-what-works-how).
 - **Teacher tools.** Teachers can create "scan assignments" that support one-click turn in, and copy scanner links for any assignment.
+- **Classroom add-on (optional).** Teachers add Doc Scanner to *any* assignment from Classroom's **Add-ons** menu. Students scan inside the assignment and turn in with Classroom's own button. See [Classroom add-on](#classroom-add-on).
 - Upload or drag in photos too. A camera picker appears for external or document cameras. Keyboard shortcuts: `Space` captures, `A` toggles auto-capture, `S` saves, `Esc` closes. Dark mode follows the system. It can be installed as an app from Chrome's address bar.
 
 Nobody has to sign in to scan. Google sign-in appears the first time someone clicks **Save**.
@@ -72,6 +73,8 @@ Ask your admin to check these if sign-in fails or Classroom shows errors:
 | See your Classroom classes (`classroom.courses.readonly`) | List classes |
 | See and turn in your Classroom work (`classroom.coursework.me`) | List assignments, attach the PDF, turn in |
 | Manage coursework for your students (`classroom.coursework.students`) | Teachers only: requested the first time a teacher creates a scan assignment |
+| Classroom add-on permissions (`classroom.addons.student`, `classroom.addons.teacher`) | Add-on only: attach the scanner to an assignment, and know whose submission a scan belongs to |
+| See class rosters and their email addresses (`classroom.rosters.readonly`, `classroom.profile.emails`) | Add-on only, students: share their scan with the class's teachers |
 
 Sign-ins last about an hour per browser tab. After that, clicking Save asks again; there's normally no password to retype.
 
@@ -90,6 +93,77 @@ Scanner handles both cases:
 
 - **New scan assignment** posts an assignment that supports one-click turn in. The scanner link goes into the instructions automatically.
 - **Link for existing assignment** copies a link like `…/google-drive-scanner/?course=123&assignment=456`. Opening it starts the scanner with that assignment preselected and the Save button reading "Turn in to Classroom".
+
+## Classroom add-on
+
+The add-on puts the scanner **inside Classroom** and works with assignments teachers create the normal way.
+The GitHub Pages site keeps working exactly as before. Both run the **same code**, so they can't fall out
+of sync:
+
+| Who | Classroom opens | Code |
+| --- | --- | --- |
+| Teacher, adding it to an assignment (Add-ons menu) | `addon.html?view=setup` | `addon.js` |
+| Student, opening the attachment | `index.html?addon=student`: the regular scanner, in add-on mode | `app.js` (same scanner as the site) |
+| Teacher, opening the attachment | `addon.html?view=teacher`: every student's scan | `addon.js` |
+| Teacher, grading one student | `addon.html?view=review`: that student's PDF | `addon.js` |
+
+All Google calls for both live in `google.js`. A scanner fix or improvement ships to the website and the add-on
+with the same push.
+
+### How it works for students
+
+1. They open the assignment in Classroom and click the **Scan your work** attachment.
+2. The scanner opens inside Classroom. They scan and click **Submit to Classroom**. The first time, Google asks for permission.
+3. The PDF goes to their Drive (`Scanned Assignments`), shared view-only with the class's teachers. If they scan again, the new PDF replaces the old one.
+4. They click Classroom's own **Turn in** button. Add-ons can't turn work in themselves; Classroom keeps that button.
+
+If Classroom doesn't let the scanner use the camera inside the assignment, it says so and offers **Open in a new tab**.
+The scan still goes to the same assignment. There's also an **Open in new tab ↗** button for a bigger view.
+
+Teachers see the scan in Classroom's grading view (the student work review pane) and on the attachment itself.
+Nothing extra is stored anywhere: the student's Drive holds the file, and the scan is linked to the assignment by
+private app properties that only this app can read.
+
+### Setting it up
+
+Use the **same Google Cloud project** as the website. The add-on has to be published from the project that owns
+the OAuth client.
+
+1. **Check licensing.** Teachers need a license that includes Classroom add-ons. Google has offered them with
+   **Google Workspace for Education Plus** or the **Teaching and Learning Upgrade**. Check what your school has
+   before going further.
+2. **Enable the APIs.** In **APIs & Services → Library**, enable the **Google Workspace Marketplace SDK** (Drive and
+   Classroom are already on).
+3. **Add the scopes** to the consent screen (**Google Auth Platform → Data access**):
+   `classroom.addons.student`, `classroom.addons.teacher`, `classroom.rosters.readonly`, `classroom.profile.emails`
+   (plus the ones already listed above).
+4. **Configure the add-on.** Open **Google Workspace Marketplace SDK → App configuration**:
+   - App visibility: **Private** (your school only).
+   - Installation: admin-only install is simplest.
+   - App integrations: **Classroom add-on**.
+     - **Attachment Setup URI:** `https://akoch-cls.github.io/google-drive-scanner/addon.html?view=setup`
+     - **Allowed attachment URI prefixes:** `https://akoch-cls.github.io/google-drive-scanner/`
+   - OAuth scopes: the same list as the consent screen (`openid`, `email`, `drive`, `classroom.courses.readonly`,
+     `classroom.coursework.me`, `classroom.coursework.students` and the four above).
+   - Fill in the developer details, then go to **Store listing**, add the required icons and support links, and click **Publish**.
+     Private apps aren't reviewed by Google.
+5. **Install it for the school.** In the **Admin console → Apps → Google Workspace Marketplace apps**, find Doc Scanner
+   (under your domain's private apps) and **install** it for the teachers' and students' organizational units. That also
+   pre-approves its permissions.
+6. **Teachers:** create an assignment in Classroom, click **Add-ons → Doc Scanner**, keep or change the title,
+   click **Add to assignment**, and post.
+
+### Things to check in a test class first
+
+These can't be tested outside a real Classroom domain:
+
+- **Camera inside Classroom.** Whether Classroom lets an add-on use the camera in its frame isn't documented. If it
+  doesn't, students get the "Open in a new tab" button; the flow still works, with one extra click.
+- **Sign-in inside Classroom.** Google's sign-in pop-up opens from the frame. If the browser blocks pop-ups,
+  students need to allow them for the site once.
+- **Sharing with teachers.** The scan is shared with the class's teacher group, or with each teacher's email if
+  Classroom doesn't give students the group. A co-teacher added later won't see scans submitted before they joined
+  until the student scans again.
 
 ## Tips for good scans
 
@@ -143,6 +217,13 @@ Open <http://localhost:8080>. In `--mock` mode the Google APIs are replaced by f
 assignments (`dev/mock-api.js`), so you can try everything without any Google setup. Add
 `?course=c1&assignment=w1` to the URL to try a Classroom deep link.
 
+The add-on pages, with the query strings Classroom would add:
+
+- Student: <http://localhost:8080/index.html?addon=student&courseId=c1&itemId=w1&attachmentId=att1>
+- Teacher set-up: <http://localhost:8080/addon.html?view=setup&courseId=c1&itemId=w1&itemType=courseWork&addOnToken=x>
+- Teacher view: <http://localhost:8080/addon.html?view=teacher&asTeacher&courseId=c1&itemId=w1&attachmentId=att1>
+- Grading view: <http://localhost:8080/addon.html?view=review&asTeacher&courseId=c1&itemId=w1&attachmentId=att1&submissionId=sub-ada>
+
 Run `node dev/serve.js` without `--mock` to use real Google sign-in. That needs
 `http://localhost:8080` in the client's Authorized JavaScript origins.
 
@@ -173,8 +254,9 @@ docs/                  the website (GitHub Pages serves this folder)
   config.js            your Google OAuth client ID
   vision.js            image processing: detection, line refinement, aspect ratio, focus, warp, filters
   hands.js             hand tracking (MediaPipe) → finger mask
-  google.js            sign-in, Drive, Classroom, PDF builder
-  app.js               UI: camera loop, auto-capture, editor, save flows
+  google.js            sign-in, Drive, Classroom, Classroom add-on, PDF builder
+  app.js               UI: camera loop, auto-capture, editor, save flows (and the add-on's student view)
+  addon.html, addon.js Classroom add-on teacher pages: set-up, all scans, grading view
   manifest.webmanifest, icon.svg   lets Chrome install it as an app
 dev/
   serve.js             local server (camera needs localhost or https)

@@ -4,6 +4,7 @@
  *  - Sign-in with Google Identity Services (OAuth token model, no server)
  *  - Drive: browse/search/create folders, upload the PDF
  *  - Classroom: list classes and assignments, attach + turn in, teacher tools
+ *  - Classroom add-on: attach the scanner to any assignment, submit and review scans
  *  - buildPdf: wraps the finished JPEG pages in a PDF
  *
  * Every call runs in the browser with the signed-in user's own access token,
@@ -30,11 +31,20 @@ const ScannerAPI = (() => {
   ];
   // Only requested when a teacher creates an assignment.
   const TEACHER_SCOPES = ['https://www.googleapis.com/auth/classroom.coursework.students'];
+  // Only requested inside the Classroom add-on. Students also need to look up
+  // their teachers, to share the scan with them.
+  const ADDON_STUDENT_SCOPES = [
+    'https://www.googleapis.com/auth/classroom.addons.student',
+    'https://www.googleapis.com/auth/classroom.rosters.readonly',
+    'https://www.googleapis.com/auth/classroom.profile.emails'
+  ];
+  const ADDON_TEACHER_SCOPES = ['https://www.googleapis.com/auth/classroom.addons.teacher'];
 
   let token = loadToken();     // { access_token, expires_at, scope }
   let client = null;
   let email = token && token.email || '';
   let rootId = null;
+  let loginHint = '';          // Classroom passes the signed-in user as login_hint
   const listeners = [];
 
   // ---------------------------------------------------------------------------
@@ -129,7 +139,7 @@ const ScannerAPI = (() => {
           : err && err.type === 'popup_failed_to_open' ? 'Your browser blocked the Google sign-in pop-up. Allow pop-ups for this site and try again.'
             : 'Google sign-in failed.'));
       };
-      client.requestAccessToken({ scope: needed.join(' '), hint: email || undefined, prompt: '' });
+      client.requestAccessToken({ scope: needed.join(' '), hint: email || loginHint || undefined, prompt: '' });
     });
   }
 
@@ -342,11 +352,12 @@ const ScannerAPI = (() => {
     });
   }
 
-  async function uploadPdf(folderId, name, pages, onProgress) {
+  async function uploadPdf(folderId, name, pages, onProgress, extra) {
     name = cleanName(name) || 'Scan';
     if (!/\.pdf$/i.test(name)) name += '.pdf';
     const pdf = buildPdf(decodePages(pages));
-    const f = await uploadFile(pdf, { name, mimeType: 'application/pdf', parents: [folderId || 'root'] }, onProgress);
+    const meta = Object.assign({ name, mimeType: 'application/pdf', parents: [folderId || 'root'] }, extra);
+    const f = await uploadFile(pdf, meta, onProgress);
     return { id: f.id, name: f.name, url: f.webViewLink || 'https://drive.google.com/file/d/' + f.id + '/view' };
   }
 
@@ -598,17 +609,186 @@ const ScannerAPI = (() => {
     return { id: created.id, title: created.title, link: created.alternateLink, scanLink: link };
   }
 
+  // ---------------------------------------------------------------------------
+  // Classroom add-on
+  //
+  // Classroom shows the add-on in iframes and passes the context in the query
+  // string (courseId, itemId, itemType, attachmentId, addOnToken, submissionId,
+  // login_hint). There's no server: a student's scan is a PDF in their own Drive,
+  // tagged with appProperties (only this app can see or search those) and shared
+  // with the class's teachers, so the teacher's review pane can find it.
+  // ---------------------------------------------------------------------------
+
+  const ITEM_COLLECTIONS = { courseWork: 'courseWork', courseWorkMaterial: 'courseWorkMaterials', announcement: 'announcements' };
+
+  /** Reads Classroom's query parameters. Returns null outside the add-on. */
+  function addOnContext(params) {
+    params = params || Object.fromEntries(new URLSearchParams(location.search));
+    const itemId = params.itemId || params.postId;
+    if (!params.courseId || !itemId) return null;
+    if (params.login_hint) loginHint = params.login_hint;
+    return {
+      courseId: params.courseId,
+      itemId,
+      itemType: params.itemType || 'courseWork',
+      attachmentId: params.attachmentId || '',
+      addOnToken: params.addOnToken || '',
+      submissionId: params.submissionId || ''
+    };
+  }
+
+  function itemBase(ctx) {
+    const coll = ITEM_COLLECTIONS[ctx.itemType] || 'courseWork';
+    return CLASSROOM + '/courses/' + encodeURIComponent(ctx.courseId) + '/' + coll + '/' + encodeURIComponent(ctx.itemId);
+  }
+
+  /** The folder the add-on pages are served from, e.g. https://x.github.io/google-drive-scanner/ */
+  function siteBase() {
+    return location.origin + location.pathname.replace(/[^/]*$/, '');
+  }
+
+  /** Teacher: adds the scanner to an assignment (from the attachment set-up iframe). */
+  async function createAddOnAttachment(ctx, title) {
+    if (ctx.itemType !== 'courseWork') {
+      throw new Error('Doc Scanner can only be added to assignments, since students turn in what they scan.');
+    }
+    const base = siteBase();
+    return request(itemBase(ctx) + '/addOnAttachments', {
+      method: 'POST',
+      query: { addOnToken: ctx.addOnToken },
+      body: {
+        title: String(title || '').trim() || 'Scan your work',
+        teacherViewUri: { uri: base + 'addon.html?view=teacher' },
+        studentViewUri: { uri: base + 'index.html?addon=student' },
+        studentWorkReviewUri: { uri: base + 'addon.html?view=review' }
+      }
+    });
+  }
+
+  /** Who's looking (student: their submission id) and what the attachment is called. */
+  async function getAddOnInfo(ctx) {
+    const [context, attachment] = await Promise.all([
+      request(itemBase(ctx) + '/addOnContext', { query: { attachmentId: ctx.attachmentId, addOnToken: ctx.addOnToken || undefined } }),
+      request(itemBase(ctx) + '/addOnAttachments/' + encodeURIComponent(ctx.attachmentId)).catch(() => ({}))
+    ]);
+    let itemTitle = '';
+    try {
+      const work = await request(itemBase(ctx), { query: { fields: 'title' } });
+      itemTitle = work.title || '';
+    } catch (err) { /* the attachment title is enough */ }
+    return {
+      isStudent: !!context.studentContext,
+      isTeacher: !!context.teacherContext,
+      submissionId: context.studentContext && context.studentContext.submissionId || '',
+      title: attachment.title || '',
+      itemTitle
+    };
+  }
+
+  const scanFields = 'files(id,name,webViewLink,modifiedTime,owners(displayName,emailAddress),appProperties)';
+
+  function scanFile(f) {
+    const owner = (f.owners && f.owners[0]) || {};
+    return {
+      id: f.id, name: f.name, modified: f.modifiedTime,
+      url: f.webViewLink || 'https://drive.google.com/file/d/' + f.id + '/view',
+      preview: 'https://drive.google.com/file/d/' + f.id + '/preview',
+      student: owner.displayName || owner.emailAddress || '',
+      studentEmail: owner.emailAddress || '',
+      submissionId: f.appProperties && f.appProperties.scanSubmission || ''
+    };
+  }
+
+  async function findScans(key, value, mineOnly) {
+    const q = "appProperties has { key='" + key + "' and value=" + quote(value) + ' } and trashed = false' +
+      (mineOnly ? " and 'me' in owners" : '');
+    const res = await request(DRIVE + '/files', {
+      query: { q, fields: scanFields, orderBy: 'modifiedTime desc', pageSize: 1000, supportsAllDrives: true, includeItemsFromAllDrives: true }
+    });
+    return (res.files || []).map(scanFile);
+  }
+
+  /** Student: the scan they've already submitted for this attachment, if any. */
+  async function getMyAddOnScan(ctx, submissionId) {
+    const files = await findScans('scanSubmission', submissionId, true);
+    return files.find(f => f.submissionId === submissionId) || null;
+  }
+
+  /** Teacher: every student's scan for this attachment, newest first. */
+  async function listAddOnScans(ctx) {
+    return findScans('scanAttachment', ctx.attachmentId, false);
+  }
+
+  /** Teacher: one student's scan (the student work review iframe). */
+  async function getAddOnScanForSubmission(ctx) {
+    const files = await findScans('scanSubmission', ctx.submissionId, false);
+    return files[0] || null;
+  }
+
+  /** Who to share a student's scan with: the course's teacher group, else each teacher. */
+  async function teacherShareTargets(courseId) {
+    try {
+      const course = await request(CLASSROOM + '/courses/' + encodeURIComponent(courseId), { query: { fields: 'teacherGroupEmail' } });
+      if (course.teacherGroupEmail) return [{ type: 'group', emailAddress: course.teacherGroupEmail }];
+    } catch (err) { /* fall back to the teacher list */ }
+    const teachers = await listAll(CLASSROOM + '/courses/' + encodeURIComponent(courseId) + '/teachers',
+      { pageSize: 100 }, 'teachers', 100);
+    return teachers
+      .map(t => t.profile && t.profile.emailAddress)
+      .filter(Boolean)
+      .map(emailAddress => ({ type: 'user', emailAddress }));
+  }
+
+  /**
+   * Student: uploads the scan, shares it with the teachers (read-only) and
+   * replaces any earlier scan for the same submission. Turning in happens with
+   * Classroom's own Turn in button.
+   */
+  async function submitAddOnScan(req) {
+    const ctx = req.context;
+    if (!req.submissionId) throw new Error("Classroom didn't say which submission is yours. Open the assignment from Classroom and try again.");
+    const targets = await teacherShareTargets(ctx.courseId);
+    if (!targets.length) throw new Error("Couldn't find this class's teachers to share your scan with.");
+    const earlier = await findScans('scanSubmission', req.submissionId, true);
+    const folder = await findOrCreateFolder(CLASSROOM_FOLDER_NAME);
+    const file = await uploadPdf(folder.id, req.name, req.pages, req.onProgress, {
+      description: 'Scanned with Doc Scanner for Google Classroom.',
+      appProperties: {
+        scanCourse: ctx.courseId, scanItem: ctx.itemId,
+        scanAttachment: ctx.attachmentId, scanSubmission: req.submissionId
+      }
+    });
+    for (const t of targets) {
+      await request(DRIVE + '/files/' + encodeURIComponent(file.id) + '/permissions', {
+        method: 'POST',
+        query: { sendNotificationEmail: false, supportsAllDrives: true },
+        body: Object.assign({ role: 'reader' }, t)
+      });
+    }
+    await Promise.all(earlier.map(f => request(DRIVE + '/files/' + encodeURIComponent(f.id), {
+      method: 'PATCH', query: { supportsAllDrives: true }, body: { trashed: true }
+    }).catch(() => {})));
+    return { file, replaced: earlier.length };
+  }
+
+  /** Asks Classroom to close the add-on iframe (after the teacher attaches it). */
+  function closeAddOnIframe() {
+    try { window.parent.postMessage({ type: 'Classroom', action: 'closeIframe' }, '*'); } catch (err) { /* not framed */ }
+  }
+
   function cleanName(name) {
     return String(name || '').replace(/[\u0000-\u001f\/\\]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
   }
 
   return {
-    TEACHER_SCOPES,
+    TEACHER_SCOPES, ADDON_STUDENT_SCOPES, ADDON_TEACHER_SCOPES,
     isConfigured, isSignedIn, ensureSignedIn, signOut, onAuthChange,
     getEmail: () => email,
     listFolder, searchFolders, createFolder, saveScan,
     getStudentCourses, getAssignments, submitToClassroom,
     getTeachingCourses, getCourseWorkForTeacher, createScanAssignment,
+    addOnContext, createAddOnAttachment, getAddOnInfo, getMyAddOnScan, submitAddOnScan,
+    listAddOnScans, getAddOnScanForSubmission, closeAddOnIframe,
     buildPdf
   };
 })();

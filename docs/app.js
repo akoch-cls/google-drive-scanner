@@ -64,7 +64,8 @@
     'resultIcon', 'resultTitle', 'resultBody', 'resultActions', 'teacherModal', 'tCourse', 'tCreate', 'tLink',
     'tTitle', 'tDesc', 'tDue', 'tPoints', 'tCreateBtn', 'tWorkList', 'tResult', 'tError', 'tBusy', 'helpModal',
     'toast', 'toastText', 'toastAction', 'edFingers', 'macTip', 'macTipClose',
-    'debugPanel', 'debugClose', 'debugCanvas', 'debugText', 'debugSave', 'signInBtn', 'account', 'accountEmail', 'signOutBtn'
+    'debugPanel', 'debugClose', 'debugCanvas', 'debugText', 'debugSave', 'signInBtn', 'account', 'accountEmail', 'signOutBtn',
+    'popoutBtn', 'openTab', 'saveTabs', 'addonSaveNote'
   ].forEach(id => { el[id] = $(id); });
 
   const state = {
@@ -97,7 +98,8 @@
     browse: null,
     saveTab: 'drive',
     cls: { courses: null, error: null, courseId: null, assignments: {}, selected: null, target: null },
-    teacher: { courses: null, work: {} }
+    teacher: { courses: null, work: {} },
+    addon: null          // Classroom add-on student view: { ctx, framed, info, existing }
   };
 
   const workCanvas = Vision.createCanvas(CONFIG.detectWidth, 270);
@@ -286,6 +288,12 @@
       if (deviceId && err.name === 'OverconstrainedError') return startCamera(null);
       const blocked = err.name === 'NotAllowedError' || err.name === 'SecurityError';
       const missing = err.name === 'NotFoundError' || err.name === 'OverconstrainedError';
+      if (blocked && state.addon && state.addon.framed) {
+        showCameraError('Open the scanner in its own tab',
+          "Classroom didn't let the scanner use your camera inside the assignment. Open it in a new tab: your scan still goes to this assignment.");
+        el.openTab.classList.remove('hidden');
+        return;
+      }
       showCameraError(
         blocked ? 'Camera access is blocked' : missing ? 'No camera found' : 'Camera unavailable',
         blocked ? 'Allow camera access using the camera icon in the address bar, then try again.'
@@ -1190,10 +1198,15 @@
   // ===========================================================================
 
   function updateSaveButtonLabel() {
-    el.saveBtn.textContent = state.cls.target ? 'Turn in to Classroom' : 'Save to Drive';
+    el.saveBtn.textContent = state.addon ? 'Submit to Classroom'
+      : state.cls.target ? 'Turn in to Classroom' : 'Save to Drive';
   }
 
   function defaultFileName() {
+    if (state.addon) {
+      const info = state.addon.info || {};
+      return info.itemTitle || info.title || 'Scan';
+    }
     if (state.saveTab === 'classroom' && state.cls.selected) return state.cls.selected.title;
     const d = new Date();
     const pad = n => String(n).padStart(2, '0');
@@ -1205,7 +1218,7 @@
     if (!state.pages.length || state.openModals.length) return;
     el.saveError.classList.add('hidden');
     el.browser.classList.add('hidden');
-    setSaveTab(state.cls.target ? 'classroom' : state.saveTab);
+    setSaveTab(state.addon ? 'addon' : state.cls.target ? 'classroom' : state.saveTab);
     el.fileName.value = defaultFileName();
     el.fileName.dataset.auto = '1';
     renderDest();
@@ -1225,8 +1238,10 @@
     el.saveModal.querySelectorAll('[data-tab]').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
     el.tabDrive.classList.toggle('hidden', tab !== 'drive');
     el.tabClassroom.classList.toggle('hidden', tab !== 'classroom');
-    el.confirmSave.textContent = tab === 'classroom'
-      ? (el.turnInCheck.checked ? 'Turn in' : 'Attach') : 'Save';
+    el.saveTabs.classList.toggle('hidden', tab === 'addon');
+    el.addonSaveNote.classList.toggle('hidden', tab !== 'addon');
+    el.confirmSave.textContent = tab === 'addon' ? 'Submit'
+      : tab === 'classroom' ? (el.turnInCheck.checked ? 'Turn in' : 'Attach') : 'Save';
     if (tab === 'classroom') ensureCourses();
     if (el.fileName.dataset.auto) el.fileName.value = defaultFileName();
   }
@@ -1546,7 +1561,18 @@
       const onProgress = f => { el.saveBusyText.textContent = uploading + '… ' + Math.round(f * 100) + '%'; };
       el.saveBusyText.textContent = uploading + '…';
 
-      if (state.saveTab === 'classroom') {
+      if (state.saveTab === 'addon') {
+        const addon = state.addon;
+        if (!addon.info) await refreshAddOn(true);
+        const res = await server('submitAddOnScan', {
+          name, pages, onProgress, context: addon.ctx, submissionId: addon.info.submissionId
+        });
+        addon.existing = res.file;
+        renderAddOnBanner();
+        el.saveBusy.classList.add('hidden');
+        closeModal(el.saveModal);
+        showAddOnResult(res);
+      } else if (state.saveTab === 'classroom') {
         const res = await server('submitToClassroom', {
           name, pages, onProgress,
           courseId: assignment.courseId,
@@ -1656,6 +1682,83 @@
       ]
     });
   }
+
+  // ===========================================================================
+  // Classroom add-on (student view)
+  //
+  // Classroom opens index.html?addon=student&courseId=…&itemId=…&attachmentId=…
+  // in an iframe on the assignment. It's the same scanner; only saving differs:
+  // the PDF goes to the student's Drive, is shared with the teachers, and the
+  // student turns in with Classroom's own button. Teacher pages are addon.html.
+  // ===========================================================================
+
+  function isFramed() {
+    try { return window.top !== window.self; } catch (err) { return true; }
+  }
+
+  function setAddOn(ctx) {
+    state.addon = { ctx, framed: isFramed(), info: null, existing: null };
+    document.body.classList.add('addon');
+    el.targetClear.classList.add('hidden');
+    el.targetTitle.textContent = 'this assignment';
+    el.targetCourse.textContent = '';
+    el.targetBanner.classList.remove('hidden');
+    el.popoutBtn.classList.toggle('hidden', !state.addon.framed);
+    updateSaveButtonLabel();
+    if (api.isSignedIn()) refreshAddOn().catch(() => {});
+  }
+
+  /** Asks Classroom who's looking and whether they've already submitted a scan. */
+  async function refreshAddOn(strict) {
+    const addon = state.addon;
+    try {
+      addon.info = await server('getAddOnInfo', addon.ctx);
+      if (!addon.info.isStudent) {
+        addon.info = null;
+        throw new Error('Only students can submit scans here. Teachers see submissions in the student work view.');
+      }
+      addon.existing = await server('getMyAddOnScan', addon.ctx, addon.info.submissionId).catch(() => null);
+      renderAddOnBanner();
+    } catch (err) {
+      if (strict) throw err;
+    }
+  }
+
+  function renderAddOnBanner() {
+    const addon = state.addon;
+    const info = addon.info || {};
+    el.targetTitle.textContent = info.itemTitle || info.title || 'this assignment';
+    el.targetCourse.innerHTML = addon.existing
+      ? '· Submitted: <a href="' + esc(addon.existing.url) + '" target="_blank" rel="noopener">' + esc(addon.existing.name) +
+        '</a>. Scan again to replace it.'
+      : '';
+  }
+
+  function openInNewTab() {
+    window.open(location.href, '_blank', 'noopener');
+  }
+  el.popoutBtn.addEventListener('click', openInNewTab);
+  el.openTab.addEventListener('click', openInNewTab);
+
+  function showAddOnResult(res) {
+    const where = state.addon.framed
+      ? 'Now click <b>Turn in</b> on the assignment in Classroom.'
+      : 'Now go back to the assignment in Classroom (you can close this tab) and click <b>Turn in</b>.';
+    showResult({
+      kind: 'good',
+      title: 'Scan submitted',
+      body: '<p><b>' + esc(res.file.name) + '</b> is saved and shared with your teacher' +
+        (res.replaced ? ', replacing your earlier scan' : '') + '.</p><p>' + where + '</p>',
+      actions: [
+        { label: 'Done', primary: true, onClick: newScan },
+        { label: 'Open the PDF', href: res.file.url, close: false },
+        { label: 'Keep these pages' }
+      ]
+    });
+  }
+
+  /** Extra Google permissions the current mode needs. */
+  const modeScopes = () => (state.addon ? api.ADDON_STUDENT_SCOPES : undefined);
 
   // ===========================================================================
   // Teacher tools
@@ -1788,8 +1891,8 @@
     importFiles(el.fileInput.files);
     el.fileInput.value = '';
   });
-  el.saveBtn.addEventListener('click', () => signedIn(openSave));
-  el.signInBtn.addEventListener('click', () => signedIn(() => toast('Signed in as ' + api.getEmail())));
+  el.saveBtn.addEventListener('click', () => signedIn(openSave, modeScopes()));
+  el.signInBtn.addEventListener('click', () => signedIn(() => toast('Signed in as ' + api.getEmail()), modeScopes()));
   el.signOutBtn.addEventListener('click', () => {
     api.signOut();
     state.cls = { courses: null, error: null, courseId: null, assignments: {}, selected: null, target: state.cls.target };
@@ -1851,7 +1954,7 @@
       el.autoToggle.click();
     } else if (e.key === 's' || e.key === 'S') {
       e.preventDefault();
-      signedIn(openSave);
+      signedIn(openSave, modeScopes());
     }
   });
 
@@ -1911,8 +2014,11 @@
   api.onAuthChange(now => {
     renderAccount(now);
     if (now && !wasSignedIn) {
-      refreshTarget();
-      checkTeacher();
+      if (state.addon) refreshAddOn();
+      else {
+        refreshTarget();
+        checkTeacher();
+      }
     }
     wasSignedIn = now;
   });
@@ -1945,8 +2051,12 @@
     renderAccount(wasSignedIn);
     const params = urlParams();
     if ('debug' in params) setDebug(true);
-    if (params.course && params.assignment) setTarget(params.course, params.assignment);
-    if (wasSignedIn) checkTeacher();
+    const addOnCtx = params.addon === 'student' && api.addOnContext(params);
+    if (addOnCtx) setAddOn(addOnCtx);
+    else {
+      if (params.course && params.assignment) setTarget(params.course, params.assignment);
+      if (wasSignedIn) checkTeacher();
+    }
   }
 
   init();

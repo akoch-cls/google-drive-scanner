@@ -20,6 +20,7 @@
     <div class="topbar-right">
       <span id="cvStatus" class="chip" title="Automatic page edge detection">Loading edge detection…</span>
       <button id="teacherBtn" class="btn ghost small hidden" type="button">Teacher tools</button>
+      <button id="popoutBtn" class="btn ghost small hidden" type="button" title="Open the scanner in its own tab, with a bigger view">Open in new tab ↗</button>
       <button id="signInBtn" class="btn ghost small" type="button">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21a8 8 0 0 1 16 0"/></svg>
         Sign in
@@ -57,6 +58,7 @@
           <p id="cameraErrorText"></p>
           <div class="row center">
             <button id="retryCamera" class="btn primary" type="button">Try again</button>
+            <button id="openTab" class="btn primary hidden" type="button">Open in a new tab</button>
             <button id="uploadInstead" class="btn ghost" type="button">Upload photos</button>
           </div>
         </div>
@@ -179,7 +181,8 @@
           <div class="input-suffix"><input id="fileName" type="text" autocomplete="off" spellcheck="false"><span>.pdf</span></div>
         </label>
 
-        <div class="tabs" role="tablist">
+        <p class="muted small-text hidden" id="addonSaveNote">Your scan is saved as a PDF in your Google Drive and shared with your teachers.</p>
+        <div class="tabs" role="tablist" id="saveTabs">
           <button type="button" role="tab" data-tab="drive" class="active">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
             Google Drive

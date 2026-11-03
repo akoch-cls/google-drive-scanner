@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Doc Scanner for Classroom</title>
+  <meta name="theme-color" content="#1a73e8">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<!--
+  Teacher-facing Classroom add-on pages. Classroom opens:
+    addon.html?view=setup   when a teacher picks Doc Scanner under Add-ons on an assignment
+    addon.html?view=teacher when a teacher opens the attachment
+    addon.html?view=review  for one student's work in the grading view
+  Students get the scanner itself (index.html?addon=student). See the README.
+-->
+<body class="addon-page">
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h7l5 5v11a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zm6 1.5V9h4.5M8 13h8M8 16.5h8"/></svg>
+      <span>Doc Scanner</span>
+    </div>
+    <div class="topbar-right">
+      <span id="accountEmail" class="account-email"></span>
+    </div>
+  </header>
+
+  <main class="addon-main">
+    <!-- Sign-in gate: Google's pop-up needs a click -->
+    <section id="vSignIn" class="addon-card hidden">
+      <h2 id="signInTitle">Sign in to continue</h2>
+      <p class="muted" id="signInText">Doc Scanner needs your permission to work with this class.</p>
+      <button id="signInBtn" class="btn primary" type="button">Sign in with Google</button>
+    </section>
+
+    <!-- Attachment set-up -->
+    <section id="vSetup" class="addon-card hidden">
+      <h2>Add Doc Scanner to this assignment</h2>
+      <p class="muted">Students will see a <b>Scan your work</b> attachment. It opens the scanner; their scan is
+        saved as a PDF and shared with you, and they turn in with Classroom's own <b>Turn in</b> button.
+        You'll find each student's scan in the grading view.</p>
+      <label class="field"><span class="field-label">Attachment title</span>
+        <input id="setupTitle" type="text" value="Scan your work" maxlength="100"></label>
+      <button id="setupBtn" class="btn primary" type="button">Add to assignment</button>
+    </section>
+
+    <!-- Teacher view: all scans -->
+    <section id="vTeacher" class="addon-card wide hidden">
+      <div class="row center between">
+        <h2 id="teacherTitle">Student scans</h2>
+        <button id="teacherRefresh" class="btn ghost small" type="button">Refresh</button>
+      </div>
+      <p class="muted small-text">Scans students have submitted with Doc Scanner, newest first. To grade, open a student's
+        work in Classroom; their scan appears there too.</p>
+      <ul id="scanList" class="scan-list"></ul>
+      <a id="tryScanner" class="btn link small" target="_blank" rel="noopener">Try the scanner yourself ↗</a>
+    </section>
+
+    <!-- Student work review: one scan -->
+    <section id="vReview" class="addon-review hidden">
+      <div class="review-head">
+        <div><b id="reviewName"></b> <span class="muted" id="reviewMeta"></span></div>
+        <a id="reviewOpen" class="btn ghost small" target="_blank" rel="noopener">Open in Drive ↗</a>
+      </div>
+      <iframe id="reviewFrame" title="Student scan" allow="autoplay"></iframe>
+    </section>
+
+    <section id="vMessage" class="addon-card hidden">
+      <h2 id="msgTitle"></h2>
+      <p id="msgText" class="muted"></p>
+    </section>
+
+    <div id="busy" class="addon-busy hidden"><div class="spinner"></div></div>
+    <p class="form-error hidden" id="error"></p>
+  </main>
+
+  <script src="config.js"></script>
+  <script src="google.js"></script>
+  <script src="addon.js"></script>
+</body>
+</html>
