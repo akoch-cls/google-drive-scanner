@@ -1160,13 +1160,15 @@
   el.filterSeg.addEventListener('click', e => {
     const b = e.target.closest('button[data-filter]');
     if (!b || !editor.page) return;
-    editor.page.filter = state.defaultFilter = b.dataset.filter;
-    store('filter', state.defaultFilter);
+    // Only this page: "Use this look for all pages" is what changes the default.
+    editor.page.filter = b.dataset.filter;
     refreshEditor();
     reprocess();
   });
   el.edApplyAll.addEventListener('click', () => {
     const f = editor.page.filter;
+    state.defaultFilter = f; // new captures use it too
+    store('defaultLook', f);
     state.pages.forEach(p => {
       if (p.filter !== f) { p.filter = f; reprocess(p); }
     });
@@ -1946,7 +1948,9 @@
   async function init() {
     const savedAuto = store('auto');
     if (typeof savedAuto === 'boolean') state.autoEnabled = el.autoToggle.checked = savedAuto;
-    const savedFilter = store('filter');
+    // 'defaultLook' replaces 'filter', which was set by any click on a look and
+    // silently switched every later scan to e.g. Original.
+    const savedFilter = store('defaultLook');
     if (FILTERS.includes(savedFilter)) state.defaultFilter = savedFilter;
     if (store('removeFingers') === false) state.removeFingers = false;
     state.dest = store('dest');
