@@ -168,6 +168,13 @@ def scene(name):
         q = project(640, 560, 640, 0, 6, 2)
         paste_page(im, tex_white, q)
         return finish(im), {'expect': 'cut'}
+    if name == 'page-top-off-frame':
+        # Held so close the top runs off the frame: a line of text must not pass for the top edge.
+        im = room((214, 206, 190), face=SKIN_LIGHT, shelf=False)
+        q = project(640, 250, 560, 4, -4, 2)
+        paste_page(im, page_texture((236, 234, 228), 'Scenario 1: The Math Test'), q)
+        thumb(im, int(q[3][0] + 14), int((q[0][1] + q[3][1]) / 2 + 120), -6, SKIN_LIGHT)
+        return finish(im), {'expect': 'cut'}
     if name == 'screen-lit-face-no-page':
         im = room((110, 102, 96), face=(238, 208, 192))
         return finish(im), {'expect': 'none'}
@@ -177,7 +184,8 @@ def scene(name):
     raise KeyError(name)
 
 SCENES = ['dark-desk-thumbs', 'classroom-person', 'ceiling-light-midgray-page', 'light-wall-low-contrast',
-          'corner-covered', 'strong-tilt', 'rotated-45', 'page-cut-off', 'screen-lit-face-no-page', 'ceiling-light-no-page']
+          'corner-covered', 'strong-tilt', 'rotated-45', 'page-cut-off', 'page-top-off-frame', 'screen-lit-face-no-page',
+          'ceiling-light-no-page']
 
 if __name__ == '__main__':
     os.makedirs(OUT, exist_ok=True)

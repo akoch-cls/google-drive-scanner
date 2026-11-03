@@ -946,7 +946,7 @@ const Vision = (() => {
    * face fails on those sides. Sides hidden by a hand don't count against it.
    * @returns fraction (0–1) of sides that look like a page border
    */
-  function rimScore(imageData, quad, hand, details) {
+  function rimScore(imageData, quad, hand, details, ink) {
     const w = imageData.width, h = imageData.height, d = imageData.data;
     const q = orderCorners(quad);
     const size = Math.sqrt(polygonArea(q));
@@ -969,7 +969,7 @@ const Vision = (() => {
       nx /= nl; ny /= nl;
       if ((cx - mid.x) * nx + (cy - mid.y) * ny < 0) { nx = -nx; ny = -ny; } // point inwards
       const inn = [[], [], []], out = [[], [], []];
-      let hidden = 0, total = 0;
+      let hidden = 0, total = 0, inkOut = 0, inkN = 0;
       for (let t = 0.15; t <= 0.851; t += 0.07) {
         const px = a.x + (b.x - a.x) * t, py = a.y + (b.y - a.y) * t;
         // Inside: the brightest of a few depths, i.e. the paper rather than print near the edge.
@@ -980,22 +980,41 @@ const Vision = (() => {
           if (c && (!ci || c[0] > ci[0])) ci = c;
         }
         const co = colour(px - nx * off, py - ny * off);
+        // Writing just outside this side? Then the page continues past it.
+        if (ink) {
+          for (const depth of [0.5, 1, 1.5, 2, 2.5]) {
+            const ox = Math.round(px - nx * off * depth), oy = Math.round(py - ny * off * depth);
+            if (ox < 0 || oy < 0 || ox >= w || oy >= h) continue;
+            for (let dt = -2; dt <= 2; dt++) { // a few pixels along the side too
+              const sx = Math.round(ox + (b.x - a.x) / dist(a, b) * dt), sy = Math.round(oy + (b.y - a.y) / dist(a, b) * dt);
+              if (sx < 0 || sy < 0 || sx >= w || sy >= h) continue;
+              inkN++;
+              if (ink[sy * w + sx]) inkOut++;
+            }
+          }
+        }
         total++;
         if (ci === 'hand' || co === 'hand') { hidden++; continue; }
         if (!ci || !co) continue;
         for (let c = 0; c < 3; c++) { inn[c].push(ci[c]); out[c].push(co[c]); }
       }
       if (hidden > total * 0.5 || inn[0].length < 3) { sides.push(null); continue; } // covered by a hand / off the frame
-      sides.push({ inner: inn.map(med), outer: out.map(med) });
+      sides.push({ inner: inn.map(med), outer: out.map(med), inkOut: inkN ? inkOut / inkN : 0 });
     }
     const known = sides.filter(Boolean);
     if (!known.length) return 0.5;
     const paper = [0, 1, 2].map(c => med(known.map(sd => sd.inner[c])));
     // Lighting changes brightness across a page; the paper's tint stays put, so weigh colour more.
     const diff = (u, v) => 0.5 * Math.abs(u[0] - v[0]) + 2 * (Math.abs(u[1] - v[1]) + Math.abs(u[2] - v[2]));
+    // A side with page-coloured paper *and* writing beyond it runs through the page
+    // (a text line or table rule), not along its edge: not a page outline at all.
+    if (sides.some(sd => sd && sd.inkOut > 0.04 && diff(sd.outer, paper) < 20)) {
+      if (details) details.push('cuts through the page');
+      return 0;
+    }
     let good = 0;
     sides.forEach(sd => {
-      if (details) details.push(sd ? { toPaper: Math.round(diff(sd.inner, paper)), across: Math.round(diff(sd.inner, sd.outer)), inner: sd.inner.map(Math.round), outer: sd.outer.map(Math.round) } : 'hidden');
+      if (details) details.push(sd ? { toPaper: Math.round(diff(sd.inner, paper)), across: Math.round(diff(sd.inner, sd.outer)), inkOut: +(sd.inkOut * 100).toFixed(1), inner: sd.inner.map(Math.round), outer: sd.outer.map(Math.round) } : 'hidden');
       if (!sd) { good += 0.9; return; } // hidden by a hand: give it the benefit of the doubt
       if (diff(sd.inner, paper) < 32 && diff(sd.inner, sd.outer) > 10) good++;
     });
@@ -1403,7 +1422,7 @@ const Vision = (() => {
       s.quad = r.quad;
       s.support = r.support;
       s.meanSupport = r.meanSupport;
-      s.rim = rimScore(imageData, r.quad, skinUsable ? skin.mask : null);
+      s.rim = rimScore(imageData, r.quad, skinUsable ? skin.mask : null, null, ink);
       if (s.rim < 0.7) { s.reason = 'border isn\'t a page edge'; continue; } // needs ~3 real page-border sides
       // A side that isn't a real page border (a printed table line, a wall edge) costs a lot.
       let score = s.score * (0.4 + 0.6 * r.meanSupport) * Math.pow(s.rim, 4);
