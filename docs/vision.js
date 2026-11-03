@@ -1122,6 +1122,44 @@ const Vision = (() => {
    * 480 px, refine at ~960 px, then refine again at full resolution.
    * @returns {{ corners, touchesEdge, support } | null}  corners in source pixels
    */
+  /**
+   * Snaps rough corners (source pixels) onto the page edges: at ~960 px, then
+   * at full resolution. `firstBand` is how far (fraction of page size) to
+   * search on the first pass.
+   */
+  function refineLevels(source, corners, opts = {}) {
+    const sw = source.videoWidth || source.width, sh = source.videoHeight || source.height;
+    let quad = orderCorners(corners), support = null;
+    const levels = sw > 1200 ? [960, sw] : [sw];
+    levels.forEach((lw, k) => {
+      const img = lw === sw ? (() => { const c = createCanvas(sw, sh); const x = ctx2d(c); x.drawImage(source, 0, 0); return x.getImageData(0, 0, sw, sh); })() : shrinkTo(source, lw);
+      const s = img.width / sw;
+      const band = Math.sqrt(polygonArea(quad)) * s * (k === 0 ? (opts.firstBand || 0.025) : 0.015);
+      const r = refineQuad(img, quad.map(p => ({ x: p.x * s, y: p.y * s })), { hand: opts.hand, band });
+      quad = r.quad.map(p => ({ x: p.x / s, y: p.y / s }));
+      support = r.support;
+    });
+    return { corners: quad, support };
+  }
+
+  /**
+   * Turns the neural network's corners into a page outline: checks it's a
+   * plausible page, flags it as cut off when a corner is out of the picture,
+   * then snaps it onto the real edges.
+   * @param model  result of DocModel.detect
+   * @returns {{ corners, touchesEdge, support, confidence } | null}
+   */
+  function pageFromModel(source, model, opts = {}) {
+    if (!model || !model.found) return null;
+    const sw = source.videoWidth || source.width, sh = source.videoHeight || source.height;
+    const q = orderCorners(model.corners.map(c => ({ x: c.x, y: c.y })));
+    if (!isConvex(q) || !looksLikePage(q) || polygonArea(q) < sw * sh * 0.04) return null;
+    const edge = Math.min(sw, sh) * 0.012;
+    const touchesEdge = q.some(p => p.x <= edge || p.y <= edge || p.x >= sw - 1 - edge || p.y >= sh - 1 - edge);
+    const refined = opts.refine === false ? { corners: q, support: null } : refineLevels(source, q, { hand: opts.hand, firstBand: 0.04 });
+    return { corners: refined.corners, touchesEdge, support: refined.support, confidence: model.confidence };
+  }
+
   function locatePage(source, opts = {}) {
     const sw = source.videoWidth || source.width, sh = source.videoHeight || source.height;
     const small = shrinkTo(source, Math.min(480, sw));
@@ -1788,6 +1826,7 @@ const Vision = (() => {
     createCanvas, ctx2d, orderCorners, fullFrame, polygonArea,
     toGray, meanAbsDiff, sharpness,
     detectQuad, warp, rotate, applyFilter, quadSize, removeFingers,
-    refineQuad, estimateAspect, maskCoverage, locatePage, shrinkTo, inset, skinMask, rimScore
+    refineQuad, estimateAspect, maskCoverage, locatePage, shrinkTo, inset, skinMask, rimScore,
+    refineLevels, pageFromModel
   };
 })();

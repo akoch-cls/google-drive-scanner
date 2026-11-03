@@ -3,3 +3,4 @@ node_modules/
 dev/eval/fixtures/
 dev/eval/private/
 __pycache__/
+docs/models/*.onnx

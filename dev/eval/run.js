@@ -17,6 +17,8 @@
  * Options: --opencv <path to opencv.js> (default: download from docs.opencv.org),
  *          --hands (also run the MediaPipe hand tracker, as the app does; downloads it
  *            unless --mediapipe <tasks-vision package dir> and --hand-model <.task file> are given),
+ *          --model <onnxruntime-web package dir> (use the DocAligner network, as the app does;
+ *            add --raw to score its corners before edge refinement),
  *          --show (write annotated images next to the frames, in ./out).
  * Needs Playwright: npm install --no-save playwright
  */
@@ -33,6 +35,9 @@ const mediapipeDir = opt('--mediapipe');
 const handModel = opt('--hand-model');
 const useHands = flag('--hands') || !!mediapipeDir;
 const debugOut = flag('--debug');
+const ortDir = opt('--model');
+const rawModel = flag('--raw');
+const channels = opt('--channels');
 const dir = path.resolve(args[0] || path.join(__dirname, 'fixtures'));
 const docs = path.join(__dirname, '..', '..', 'docs');
 const truth = JSON.parse(fs.readFileSync(path.join(dir, 'truth.json'), 'utf8'));
@@ -85,6 +90,12 @@ function cornerError(det, gt) { // best cyclic alignment, max corner distance / 
       return r.fulfill({ path: path.join(mediapipeDir, p), contentType: p.endsWith('.wasm') ? 'application/wasm' : 'text/javascript', headers: { 'access-control-allow-origin': '*' } });
     });
   }
+  if (ortDir) {
+    await page.route('https://cdn.jsdelivr.net/npm/onnxruntime-web@*/dist/**', r => {
+      const p = new URL(r.request().url()).pathname.replace(/^\/npm\/onnxruntime-web@[^/]+\/dist\//, '');
+      return r.fulfill({ path: path.join(ortDir, 'dist', p), contentType: p.endsWith('.wasm') ? 'application/wasm' : 'text/javascript', headers: { 'access-control-allow-origin': '*' } });
+    });
+  }
   if (handModel) {
     await page.route('https://storage.googleapis.com/**', r => r.fulfill({ path: handModel, contentType: 'application/octet-stream', headers: { 'access-control-allow-origin': '*' } }));
   }
@@ -101,6 +112,10 @@ function cornerError(det, gt) { // best cyclic alignment, max corner distance / 
   await page.waitForFunction(() => window.cv && (window.cv.Mat || window.cv.then || window.cv.onRuntimeInitialized !== undefined), null, { timeout: 120000 });
   await page.evaluate(() => new Promise(r => { if (cv.Mat) r(); else if (typeof cv.then === 'function') cv.then(m => { window.cv = m; r(); }); else cv.onRuntimeInitialized = r; }));
   await page.addScriptTag({ url: 'http://eval.local/docs/vision.js' });
+  if (ortDir) {
+    await page.addScriptTag({ url: 'http://eval.local/docs/docmodel.js' });
+    console.log('page model: ' + await page.evaluate(ch => DocModel.load({ modelUrl: '/docs/models/docaligner-lcnet100.onnx', channels: ch || undefined }), channels));
+  }
   if (useHands) {
     await page.addScriptTag({ url: 'http://eval.local/docs/hands.js' });
     const status = await page.evaluate(() => Hands.load());
@@ -111,7 +126,7 @@ function cornerError(det, gt) { // best cyclic alignment, max corner distance / 
   if (show) fs.mkdirSync(path.join(dir, 'out'), { recursive: true });
   for (const name of Object.keys(truth)) {
     const t = truth[name];
-    const r = await page.evaluate(async ({ name, show, debugOut }) => {
+    const r = await page.evaluate(async ({ name, show, debugOut, rawModel }) => {
       const img = new Image(); img.src = '/' + encodeURIComponent(name); await img.decode();
       const full = document.createElement('canvas'); full.width = img.width; full.height = img.height;
       full.getContext('2d').drawImage(img, 0, 0);
@@ -125,7 +140,13 @@ function cornerError(det, gt) { // best cyclic alignment, max corner distance / 
       }
       const dbg = debugOut ? {} : null;
       opts.debug = dbg;
-      const res = Vision.locatePage ? Vision.locatePage(full, opts) : (() => {
+      let modelOut = null;
+      if (typeof DocModel !== 'undefined' && DocModel.status() === 'ready') modelOut = await DocModel.detect(full);
+      const handFull = opts.hand && { mask: opts.hand.mask, width: opts.hand.width, height: opts.hand.height };
+      const res = modelOut ? Vision.pageFromModel(full, modelOut, { refine: !rawModel, hand: handFull && (() => {
+        // refineQuad looks the hand mask up by position, so any resolution works
+        return handFull;
+      })() }) : Vision.locatePage ? Vision.locatePage(full, opts) : (() => {
         const w = 480, h = Math.round(img.height * w / img.width);
         const c = document.createElement('canvas'); c.width = w; c.height = h;
         const x = c.getContext('2d', { willReadFrequently: true }); x.imageSmoothingQuality = 'high'; x.drawImage(img, 0, 0, w, h);
@@ -144,11 +165,13 @@ function cornerError(det, gt) { // best cyclic alignment, max corner distance / 
       const debugLines = dbg && (dbg.candidates || []).map(k => '    ' + (k.reason || ('score ' + (k.finalScore || k.score || 0).toFixed(3))) +
         ' fill ' + (k.fill || 0).toFixed(2) + (k.rim != null ? ' rim ' + k.rim.toFixed(2) : '') + ' ink ' + ((k.inkFrac || 0) * 100).toFixed(1) + '% ' + JSON.stringify(k.quad.map(p => [Math.round(p.x), Math.round(p.y)])));
       const handPixels = opts.hand ? opts.hand.mask.reduce((a, b) => a + b, 0) : null;
-      return { ms, png, corners: res && res.corners.map(p => [p.x, p.y]), touchesEdge: !!(res && res.touchesEdge), aspect, debugLines, handPixels };
-    }, { name, show, debugOut });
+      return { ms, png, corners: res && res.corners.map(p => [p.x, p.y]), touchesEdge: !!(res && res.touchesEdge), aspect, debugLines, handPixels,
+        modelConf: modelOut ? modelOut.confidence : null };
+    }, { name, show, debugOut, rawModel });
     if (r.debugLines) console.log(name + (r.handPixels != null ? ' (hand pixels ' + r.handPixels + ')' : '') + '\n' + r.debugLines.join('\n'));
     if (r.png) fs.writeFileSync(path.join(dir, 'out', name.replace(/\.\w+$/, '.png')), Buffer.from(r.png, 'base64'));
     const row = { name, ms: Math.round(r.ms) };
+    if (r.modelConf != null) row.extra = 'conf ' + r.modelConf.toFixed(2);
     if (t.expect === 'none') row.ok = !r.corners, row.note = r.corners ? 'FALSE DETECTION' : 'nothing found (correct)';
     else if (t.expect === 'cut') row.ok = !r.corners || r.touchesEdge, row.note = !r.corners ? 'nothing found' : r.touchesEdge ? 'flagged as cut off (correct)' : 'NOT FLAGGED AS CUT OFF';
     else if (!r.corners) row.ok = false, row.note = 'MISSED';
@@ -166,7 +189,7 @@ function cornerError(det, gt) { // best cyclic alignment, max corner distance / 
   const pad = (s, n) => String(s).padEnd(n);
   console.log(pad('frame', 34) + pad('IoU', 8) + pad('corner err', 12) + pad('aspect err', 12) + pad('ms', 6) + 'note');
   rows.forEach(r => console.log(pad(r.name, 34) + pad(r.iou != null ? r.iou.toFixed(3) : '–', 8) + pad(r.err != null ? r.err.toFixed(4) : '–', 12) +
-    pad(r.aspectErr != null ? (r.aspectErr * 100).toFixed(1) + '%' : '–', 12) + pad(r.ms, 6) + (r.note || '')));
+    pad(r.aspectErr != null ? (r.aspectErr * 100).toFixed(1) + '%' : '–', 12) + pad(r.ms, 6) + (r.note || '') + (r.extra ? '  [' + r.extra + ']' : '')));
   const pages = rows.filter(r => r.iou != null || r.note === 'MISSED');
   const scored = rows.filter(r => r.iou != null);
   const mean = scored.reduce((s, r) => s + r.iou, 0) / Math.max(1, pages.length);
