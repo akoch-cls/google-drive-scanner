@@ -15,6 +15,8 @@
  *   node dev/eval/run.js dev/eval/private      # score your own frames (see README)
  *
  * Options: --opencv <path to opencv.js> (default: download from docs.opencv.org),
+ *          --hands (also run the MediaPipe hand tracker, as the app does; downloads it
+ *            unless --mediapipe <tasks-vision package dir> and --hand-model <.task file> are given),
  *          --show (write annotated images next to the frames, in ./out).
  * Needs Playwright: npm install --no-save playwright
  */
@@ -27,6 +29,10 @@ const opt = name => { const i = args.indexOf(name); return i >= 0 ? args.splice(
 const flag = name => { const i = args.indexOf(name); if (i >= 0) args.splice(i, 1); return i >= 0; };
 const opencvPath = opt('--opencv');
 const show = flag('--show');
+const mediapipeDir = opt('--mediapipe');
+const handModel = opt('--hand-model');
+const useHands = flag('--hands') || !!mediapipeDir;
+const debugOut = flag('--debug');
 const dir = path.resolve(args[0] || path.join(__dirname, 'fixtures'));
 const docs = path.join(__dirname, '..', '..', 'docs');
 const truth = JSON.parse(fs.readFileSync(path.join(dir, 'truth.json'), 'utf8'));
@@ -73,6 +79,15 @@ function cornerError(det, gt) { // best cyclic alignment, max corner distance / 
   const browser = await chromium.launch();
   const page = await browser.newPage();
   page.on('pageerror', e => console.error('page error:', e.message));
+  if (mediapipeDir) {
+    await page.route('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@*/**', r => {
+      const p = new URL(r.request().url()).pathname.replace(/^\/npm\/@mediapipe\/tasks-vision@[^/]+\//, '');
+      return r.fulfill({ path: path.join(mediapipeDir, p), contentType: p.endsWith('.wasm') ? 'application/wasm' : 'text/javascript', headers: { 'access-control-allow-origin': '*' } });
+    });
+  }
+  if (handModel) {
+    await page.route('https://storage.googleapis.com/**', r => r.fulfill({ path: handModel, contentType: 'application/octet-stream', headers: { 'access-control-allow-origin': '*' } }));
+  }
   await page.route('http://eval.local/**', r => {
     const p = new URL(r.request().url()).pathname;
     if (p === '/') return r.fulfill({ contentType: 'text/html', body: '<!doctype html><body></body>' });
@@ -86,17 +101,31 @@ function cornerError(det, gt) { // best cyclic alignment, max corner distance / 
   await page.waitForFunction(() => window.cv && (window.cv.Mat || window.cv.then || window.cv.onRuntimeInitialized !== undefined), null, { timeout: 120000 });
   await page.evaluate(() => new Promise(r => { if (cv.Mat) r(); else if (typeof cv.then === 'function') cv.then(m => { window.cv = m; r(); }); else cv.onRuntimeInitialized = r; }));
   await page.addScriptTag({ url: 'http://eval.local/docs/vision.js' });
+  if (useHands) {
+    await page.addScriptTag({ url: 'http://eval.local/docs/hands.js' });
+    const status = await page.evaluate(() => Hands.load());
+    console.log('hand tracker: ' + status);
+  }
 
   const rows = [];
   if (show) fs.mkdirSync(path.join(dir, 'out'), { recursive: true });
   for (const name of Object.keys(truth)) {
     const t = truth[name];
-    const r = await page.evaluate(async ({ name, show }) => {
+    const r = await page.evaluate(async ({ name, show, debugOut }) => {
       const img = new Image(); img.src = '/' + encodeURIComponent(name); await img.decode();
       const full = document.createElement('canvas'); full.width = img.width; full.height = img.height;
       full.getContext('2d').drawImage(img, 0, 0);
       const t0 = performance.now();
-      const res = Vision.locatePage ? Vision.locatePage(full) : (() => {
+      let opts = {};
+      if (typeof Hands !== 'undefined' && Hands.status() === 'ready') {
+        Hands.track(full);
+        const found = Hands.track(full);
+        const w = 480, h = Math.round(img.height * w / img.width);
+        opts = { handTracker: true, hand: { mask: Hands.mask(found, w, h) || new Uint8Array(w * h), width: w, height: h } };
+      }
+      const dbg = debugOut ? {} : null;
+      opts.debug = dbg;
+      const res = Vision.locatePage ? Vision.locatePage(full, opts) : (() => {
         const w = 480, h = Math.round(img.height * w / img.width);
         const c = document.createElement('canvas'); c.width = w; c.height = h;
         const x = c.getContext('2d', { willReadFrequently: true }); x.imageSmoothingQuality = 'high'; x.drawImage(img, 0, 0, w, h);
@@ -112,8 +141,12 @@ function cornerError(det, gt) { // best cyclic alignment, max corner distance / 
         png = full.toDataURL('image/png').split(',')[1];
       }
       const aspect = res && Vision.estimateAspect ? Vision.estimateAspect(res.corners, img.width, img.height) : null;
-      return { ms, png, corners: res && res.corners.map(p => [p.x, p.y]), touchesEdge: !!(res && res.touchesEdge), aspect };
-    }, { name, show });
+      const debugLines = dbg && (dbg.candidates || []).map(k => '    ' + (k.reason || ('score ' + (k.finalScore || k.score || 0).toFixed(3))) +
+        ' fill ' + (k.fill || 0).toFixed(2) + (k.rim != null ? ' rim ' + k.rim.toFixed(2) : '') + ' ink ' + ((k.inkFrac || 0) * 100).toFixed(1) + '% ' + JSON.stringify(k.quad.map(p => [Math.round(p.x), Math.round(p.y)])));
+      const handPixels = opts.hand ? opts.hand.mask.reduce((a, b) => a + b, 0) : null;
+      return { ms, png, corners: res && res.corners.map(p => [p.x, p.y]), touchesEdge: !!(res && res.touchesEdge), aspect, debugLines, handPixels };
+    }, { name, show, debugOut });
+    if (r.debugLines) console.log(name + (r.handPixels != null ? ' (hand pixels ' + r.handPixels + ')' : '') + '\n' + r.debugLines.join('\n'));
     if (r.png) fs.writeFileSync(path.join(dir, 'out', name.replace(/\.\w+$/, '.png')), Buffer.from(r.png, 'base64'));
     const row = { name, ms: Math.round(r.ms) };
     if (t.expect === 'none') row.ok = !r.corners, row.note = r.corners ? 'FALSE DETECTION' : 'nothing found (correct)';

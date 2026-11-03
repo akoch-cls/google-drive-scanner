@@ -384,7 +384,9 @@
     if (state.cvReady) {
       try {
         const prior = state.rawQuad ? state.rawQuad.map(p => ({ x: p.x * sw, y: p.y * sh })) : null;
-        found = Vision.detectQuad(frame, { debug: debugInfo, prior, hand: state.handInfo });
+        // With the hand tracker running, its mask is the only source of "hand" (skin colour
+        // also matches cream walls, wood and warm light).
+        found = Vision.detectQuad(frame, { debug: debugInfo, prior, hand: state.handInfo, handTracker: Hands.status() === 'ready' });
         if (found) {
           // Snap the edges again at twice the resolution.
           const half = halfCtx.getImageData(0, 0, hw, hh), s = hw / sw;
@@ -403,10 +405,11 @@
       state.quadCut = !!found.touchesEdge;
       state.pageSmall = Vision.polygonArea(found) < sw * sh * CONFIG.minPageArea;
       // Fingers over the writing (the page interior, away from the margins)?
-      const cover = state.handInfo
-        ? Vision.maskCoverage(found, state.handInfo.mask, sw, sh, 0.15)
+      const tracker = Hands.status() === 'ready';
+      const cover = tracker
+        ? (state.handInfo ? Vision.maskCoverage(found, state.handInfo.mask, sw, sh, 0.15) : 0)
         : Vision.maskCoverage(found, Vision.skinMask(frame).mask, sw, sh, 0.15);
-      state.fingersOver = cover > (state.handInfo ? CONFIG.maxFingerCover : CONFIG.maxSkinCover);
+      state.fingersOver = cover > (tracker ? CONFIG.maxFingerCover : CONFIG.maxSkinCover);
       if (debugInfo) { debugInfo.cover = cover; debugInfo.support = found.support; }
     }
 
@@ -594,7 +597,7 @@
       'rejected: ' + (rejected || '–'),
       'focus: ' + f.raw.toFixed(0) + ' / typical ' + f.typical.toFixed(0) + (mostlySharp() ? '  sharp' : '  blurry'),
       'motion: ' + motion.toFixed(1) + (steady ? '  steady' : '  moving') + (state.quadCut ? '   page cut off' : ''),
-      'fingers: ' + (state.handInfo ? 'hand tracker' : 'skin colour') + (info.cover != null ? ', ' + pct(info.cover) + ' of page interior' : '') +
+      'fingers: ' + (Hands.status() === 'ready' ? 'hand tracker' + (state.handInfo ? '' : ' (no hands)') : 'skin colour') + (info.cover != null ? ', ' + pct(info.cover) + ' of page interior' : '') +
         (state.fingersOver ? '  TOO MUCH' : ''),
       'edge support: ' + (info.support ? info.support.map(v => pct(v)).join(' ') : '–'),
       'camera: ' + el.video.videoWidth + '×' + el.video.videoHeight
@@ -776,7 +779,7 @@
         }).quad;
       }
       const blob = await toBlob(canvas, 'image/jpeg', 0.92);
-      await addPage(blob, vw, vh, corners);
+      await addPage(blob, vw, vh, corners, state.hands.map(hd => hd.slice()));
     } catch (err) {
       console.error(err);
       toast("Couldn't capture that page. Please try again.");
@@ -802,7 +805,8 @@
         bmp.close();
         const corners = detectInImage(canvas);
         const blob = await toBlob(canvas, 'image/jpeg', 0.92);
-        await addPage(blob, canvas.width, canvas.height, corners);
+        const hands = Hands.status() === 'ready' ? Hands.track(canvas) : null;
+        await addPage(blob, canvas.width, canvas.height, corners, hands);
       } catch (err) {
         console.error(err);
         toast("Couldn't read " + file.name + '.');
@@ -822,7 +826,8 @@
     }
   }
 
-  async function addPage(blob, w, h, corners) {
+  /** @param hands hand landmarks seen in this image (null when the hand tracker isn't running) */
+  async function addPage(blob, w, h, corners, hands = null) {
     const page = {
       id: uid(), blob, w, h,
       autoCorners: corners,
@@ -830,6 +835,7 @@
       rotation: 0,
       filter: state.defaultFilter,
       removeFingers: state.removeFingers,
+      hands: Hands.status() === 'ready' ? (hands || []) : null,
       isNew: true,
       version: 0
     };
@@ -847,9 +853,25 @@
       try {
         // Flatten to the page's real shape (Zhang & He), trimming a hair off the edges.
         page.aspect = Vision.estimateAspect(page.corners, page.w, page.h);
-        let out = Vision.warp(bmp, Vision.inset(Vision.orderCorners(page.corners), 0.004), CONFIG.maxOutputDim, page.aspect.ratio);
+        const warpCorners = Vision.inset(Vision.orderCorners(page.corners), 0.004);
+        let out = Vision.warp(bmp, warpCorners, CONFIG.maxOutputDim, page.aspect.ratio);
+        if (page.removeFingers) {
+          // With the hand tracker, paint over exactly where it saw hands (nothing if none);
+          // otherwise fall back to skin colour.
+          let fingers = {};
+          if (page.hands) {
+            if (page.hands.length) {
+              const mw = 640, mh = Math.round(page.h * mw / page.w);
+              fingers = { hand: { mask: Hands.mask(page.hands, mw, mh), width: mw, height: mh, corners: warpCorners, srcW: page.w, srcH: page.h } };
+            } else {
+              fingers = { none: true };
+            }
+          }
+          page.fingersFound = Vision.removeFingers(out, fingers) > 0;
+        } else {
+          page.fingersFound = false;
+        }
         out = Vision.rotate(out, page.rotation);
-        page.fingersFound = page.removeFingers ? Vision.removeFingers(out) > 0 : false;
         Vision.applyFilter(out, page.filter);
         if (version !== page.version) return; // superseded by a newer edit
         page.outUrl = out.toDataURL('image/jpeg', page.filter === 'bw' ? 0.8 : CONFIG.jpegQuality);

@@ -150,6 +150,31 @@ const Vision = (() => {
     return { mask, count };
   }
 
+  /**
+   * Keeps only skin-coloured regions that could be hands: a cream wall, a wooden
+   * door or warm lighting can match skin colour, but those regions are far
+   * bigger than a hand (or a face).
+   */
+  function handSizedSkin(skin, w, h, maxShare = 0.08) {
+    const n = w * h, mask = skin.mask;
+    const seen = new Uint8Array(n), queue = new Int32Array(n), out = new Uint8Array(n);
+    let count = 0;
+    for (let start = 0; start < n; start++) {
+      if (!mask[start] || seen[start]) continue;
+      let head = 0, tail = 0;
+      queue[tail++] = start; seen[start] = 1;
+      while (head < tail) {
+        const i = queue[head++], x = i % w;
+        if (x > 0 && mask[i - 1] && !seen[i - 1]) { seen[i - 1] = 1; queue[tail++] = i - 1; }
+        if (x < w - 1 && mask[i + 1] && !seen[i + 1]) { seen[i + 1] = 1; queue[tail++] = i + 1; }
+        if (i >= w && mask[i - w] && !seen[i - w]) { seen[i - w] = 1; queue[tail++] = i - w; }
+        if (i + w < n && mask[i + w] && !seen[i + w]) { seen[i + w] = 1; queue[tail++] = i + w; }
+      }
+      if (tail <= n * maxShare) { for (let k = 0; k < tail; k++) out[queue[k]] = 1; count += tail; }
+    }
+    return { mask: out, count };
+  }
+
   /** Binary max (r>0) or min (r<0) filter, separable, in place. */
   function morph(mask, w, h, r) {
     const grow = r > 0;
@@ -210,7 +235,15 @@ const Vision = (() => {
    * edge count, so coloured marks in the middle of the page are left alone.
    * Returns the fraction of the page that was painted over (0 if none).
    */
-  function removeFingers(canvas) {
+  /**
+   * @param opts.hand  optional hand-tracker mask in the *source frame*:
+   *   { mask, width, height, corners, srcW, srcH } where corners are the page
+   *   corners (source pixels) the canvas was flattened from. When given, only
+   *   those pixels count as fingers (no skin-colour guessing); pass
+   *   { none: true } when the tracker ran and saw no hands.
+   */
+  function removeFingers(canvas, opts = {}) {
+    if (opts.none) return 0;
     const W = canvas.width, H = canvas.height;
     const s = Math.min(1, 600 / Math.max(W, H));
     const w = Math.max(8, Math.round(W * s)), h = Math.max(8, Math.round(H * s));
@@ -221,7 +254,6 @@ const Vision = (() => {
     const d = sctx.getImageData(0, 0, w, h).data;
     const n = w * h;
 
-    const { mask } = skinMask({ data: d, width: w, height: h });
     const lum = new Uint8Array(n), hist = new Uint32Array(256);
     for (let i = 0, j = 0; i < n; i++, j += 4) {
       lum[i] = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;
@@ -232,16 +264,35 @@ const Vision = (() => {
       acc += hist[v];
       if (acc >= n * 0.7) { paperLevel = v; break; }
     }
+    let keep = new Uint8Array(n);
+    let kept = 0;
+    if (opts.hand) {
+      // Map each page pixel back into the camera frame and look it up in the hand mask.
+      const hm = opts.hand, sx = hm.width / hm.srcW, sy = hm.height / hm.srcH;
+      const m = squareToQuad(orderCorners(hm.corners).map(p => ({ x: p.x * sx, y: p.y * sy })));
+      for (let y = 0; y < h; y++) {
+        const v = (y + 0.5) / h;
+        for (let x = 0; x < w; x++) {
+          const u = (x + 0.5) / w;
+          const den = m.g * u + m.h * v + 1;
+          const fx = ((m.a * u + m.b * v + m.c) / den) | 0, fy = ((m.d * u + m.e * v + m.f) / den) | 0;
+          if (fx >= 0 && fy >= 0 && fx < hm.width && fy < hm.height && hm.mask[fy * hm.width + fx]) { keep[y * w + x] = 1; kept++; }
+        }
+      }
+      if (!kept) return 0;
+      // The tracker's outline is approximate: grow into the finger's rim and shadow, a little.
+      growIntoShadow(keep, lum, paperLevel, w, h, Math.max(2, Math.round(Math.min(w, h) * 0.015)));
+    }
+    const mask = opts.hand ? null : skinMask({ data: d, width: w, height: h }).mask;
+    if (mask) {
     morph(mask, w, h, -1); // drop specks
     morph(mask, w, h, 1);
 
     // Keep connected skin regions that touch the border band.
     const band = Math.max(2, Math.round(Math.min(w, h) * 0.04));
     const minArea = n * 0.0004;
-    const keep = new Uint8Array(n);
     const seen = new Uint8Array(n);
     const queue = new Int32Array(n);
-    let kept = 0;
     for (let start = 0; start < n; start++) {
       if (!mask[start] || seen[start]) continue;
       let head = 0, tail = 0, touches = false;
@@ -264,6 +315,7 @@ const Vision = (() => {
     // Nothing found, or so much "skin" that it's probably coloured paper.
     if (!kept || kept > n * 0.35) return 0;
     growIntoShadow(keep, lum, paperLevel, w, h, Math.max(3, Math.round(Math.min(w, h) * 0.03)));
+    }
     morph(keep, w, h, Math.max(2, Math.round(Math.min(w, h) * 0.008)));
 
     // Paper colour field: average the unmasked paper pixels (not ink, not
@@ -524,7 +576,46 @@ const Vision = (() => {
    * its surroundings, large, and near the middle. Faces, bookshelves and
    * clothing fail the paper test; a window loses on size and position.
    */
-  function scoreQuad(pts, paper, Y, ink, w, h) {
+  /**
+   * Fill measure for outlines built from lines: the share of the interior with
+   * the same tint as this candidate's own paper (or neutral grey print). Paper
+   * isn't always colourless on a webcam (warm light, auto white balance), so
+   * this compares against the page itself rather than against grey.
+   */
+  function tintFill(q, imageData, w, h) {
+    const d = imageData.data;
+    const xs = q.map(p => p.x), ys = q.map(p => p.y);
+    const x0 = Math.max(0, Math.floor(Math.min(...xs))), x1 = Math.min(w - 1, Math.ceil(Math.max(...xs)));
+    const y0 = Math.max(0, Math.floor(Math.min(...ys))), y1 = Math.min(h - 1, Math.ceil(Math.max(...ys)));
+    const inside = (x, y) => {
+      for (let k = 0; k < 4; k++) {
+        const a = q[k], b = q[(k + 1) % 4];
+        if ((b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x) < 0) return false;
+      }
+      return true;
+    };
+    const ys2 = [], cbs = [], crs = [];
+    for (let y = y0; y <= y1; y += 2) for (let x = x0; x <= x1; x += 2) {
+      if (!inside(x, y)) continue;
+      const j = (y * w + x) * 4;
+      ys2.push(lumaOf(d, j)); cbs.push(cbOf(d, j)); crs.push(crOf(d, j));
+    }
+    if (ys2.length < 20) return 0;
+    const sortedY = ys2.slice().sort((a, b) => a - b), yCut = sortedY[Math.floor(sortedY.length * 0.6)];
+    const bc = [], br = [];
+    ys2.forEach((v, i) => { if (v >= yCut) { bc.push(cbs[i]); br.push(crs[i]); } });
+    const med = arr => arr.sort((a, b) => a - b)[arr.length >> 1];
+    const pcb = med(bc), pcr = med(br);
+    let ok = 0;
+    for (let i = 0; i < ys2.length; i++) {
+      const paperTint = Math.abs(cbs[i] - pcb) < 9 && Math.abs(crs[i] - pcr) < 9;
+      const greyPrint = Math.abs(cbs[i] - 128) < 7 && Math.abs(crs[i] - 128) < 7 && ys2[i] < yCut;
+      if (paperTint || greyPrint) ok++;
+    }
+    return ok / ys2.length;
+  }
+
+  function scoreQuad(pts, paper, Y, ink, w, h, imageData) {
     const q = orderCorners(pts);
     const area = polygonArea(q);
     const margin = Math.sqrt(area) * 0.08;
@@ -541,7 +632,7 @@ const Vision = (() => {
         }
         const i = y * w + x;
         if (inside) {
-          nIn++; paperIn += paper[i]; sumIn += Y[i]; inkIn += ink[i];
+          nIn++; if (paper !== 'tint') paperIn += paper[i]; sumIn += Y[i]; inkIn += ink[i];
           if (Y[i] >= 250) clippedIn++;
         } else {
           nOut++; sumOut += Y[i];
@@ -549,7 +640,7 @@ const Vision = (() => {
       }
     }
     if (!nIn) return { score: 0 };
-    const fill = paperIn / nIn;
+    const fill = paper === 'tint' ? tintFill(q, imageData, w, h) : paperIn / nIn;
     const contrast = nOut ? sumIn / nIn - sumOut / nOut : 0;
     const inkFrac = inkIn / nIn, clipped = clippedIn / nIn;
     const cx = xs.reduce((a, b) => a + b) / 4, cy = ys.reduce((a, b) => a + b) / 4;
@@ -570,7 +661,8 @@ const Vision = (() => {
     else if (fill < 0.7) reason = 'not paper-coloured';
     if (reason) return Object.assign(info, { score: 0, reason });
     // The page can be brighter or darker than what's behind it (exposure is often set for a ceiling light).
-    const score = (area / (w * h)) * fill * fill * centre * (Math.abs(contrast) > 10 ? 1 : 0.4) * (touchesEdge ? 0.6 : 1);
+    // Size helps, but only gently (√area): a room-sized outline built from wall lines mustn't outrank the page.
+    const score = Math.sqrt(area / (w * h)) * fill * fill * centre * (Math.abs(contrast) > 10 ? 1 : 0.4) * (touchesEdge ? 0.6 : 1);
     return Object.assign(info, { score });
   }
 
@@ -847,6 +939,69 @@ const Vision = (() => {
     return { quad: out, support, meanSupport: support.reduce((x, y) => x + y) / 4, refined: true };
   }
 
+  /**
+   * Border check (after Tropin et al.'s inside/outside contrast re-ranking):
+   * just inside every side of a real page is the same paper colour, and it
+   * differs from what's just outside. An outline that wanders onto a wall or a
+   * face fails on those sides. Sides hidden by a hand don't count against it.
+   * @returns fraction (0–1) of sides that look like a page border
+   */
+  function rimScore(imageData, quad, hand, details) {
+    const w = imageData.width, h = imageData.height, d = imageData.data;
+    const q = orderCorners(quad);
+    const size = Math.sqrt(polygonArea(q));
+    const off = Math.max(2, size * 0.035);
+    const cx = q.reduce((a, p) => a + p.x, 0) / 4, cy = q.reduce((a, p) => a + p.y, 0) / 4;
+    const colour = (x, y) => {
+      x = Math.round(x); y = Math.round(y);
+      if (x < 0 || y < 0 || x >= w || y >= h) return null;
+      if (hand && hand[y * w + x]) return 'hand';
+      const j = (y * w + x) * 4;
+      return [lumaOf(d, j), cbOf(d, j), crOf(d, j)];
+    };
+    const med = arr => { const s2 = arr.slice().sort((a, b) => a - b); return s2[s2.length >> 1]; };
+    const sides = [];
+    for (let k = 0; k < 4; k++) {
+      const a = q[k], b = q[(k + 1) % 4];
+      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      let nx = -(b.y - a.y), ny = b.x - a.x;
+      const nl = Math.hypot(nx, ny) || 1;
+      nx /= nl; ny /= nl;
+      if ((cx - mid.x) * nx + (cy - mid.y) * ny < 0) { nx = -nx; ny = -ny; } // point inwards
+      const inn = [[], [], []], out = [[], [], []];
+      let hidden = 0, total = 0;
+      for (let t = 0.15; t <= 0.851; t += 0.07) {
+        const px = a.x + (b.x - a.x) * t, py = a.y + (b.y - a.y) * t;
+        // Inside: the brightest of a few depths, i.e. the paper rather than print near the edge.
+        let ci = null;
+        for (const depth of [0.7, 1.3, 2]) {
+          const c = colour(px + nx * off * depth, py + ny * off * depth);
+          if (c === 'hand') { ci = 'hand'; break; }
+          if (c && (!ci || c[0] > ci[0])) ci = c;
+        }
+        const co = colour(px - nx * off, py - ny * off);
+        total++;
+        if (ci === 'hand' || co === 'hand') { hidden++; continue; }
+        if (!ci || !co) continue;
+        for (let c = 0; c < 3; c++) { inn[c].push(ci[c]); out[c].push(co[c]); }
+      }
+      if (hidden > total * 0.5 || inn[0].length < 3) { sides.push(null); continue; } // covered by a hand / off the frame
+      sides.push({ inner: inn.map(med), outer: out.map(med) });
+    }
+    const known = sides.filter(Boolean);
+    if (!known.length) return 0.5;
+    const paper = [0, 1, 2].map(c => med(known.map(sd => sd.inner[c])));
+    // Lighting changes brightness across a page; the paper's tint stays put, so weigh colour more.
+    const diff = (u, v) => 0.5 * Math.abs(u[0] - v[0]) + 2 * (Math.abs(u[1] - v[1]) + Math.abs(u[2] - v[2]));
+    let good = 0;
+    sides.forEach(sd => {
+      if (details) details.push(sd ? { toPaper: Math.round(diff(sd.inner, paper)), across: Math.round(diff(sd.inner, sd.outer)), inner: sd.inner.map(Math.round), outer: sd.outer.map(Math.round) } : 'hidden');
+      if (!sd) { good += 0.9; return; } // hidden by a hand: give it the benefit of the doubt
+      if (diff(sd.inner, paper) < 32 && diff(sd.inner, sd.outer) > 10) good++;
+    });
+    return good / 4;
+  }
+
   // -------------------------------------------------------------------------
   // Page aspect ratio (Zhang & He, "Whiteboard scanning and image enhancement")
   // -------------------------------------------------------------------------
@@ -967,6 +1122,149 @@ const Vision = (() => {
   }
 
   /**
+   * Page outlines assembled from straight edge segments, as the best SmartDoc
+   * 2015 methods do (ISPL-CVML, SmartEngines): edges in brightness and in the
+   * blue–yellow channel (a cool white page against a warm cream wall differs
+   * mostly there; LRDE used L and b* the same way), minus edges under hands;
+   * straight segments from the probabilistic Hough transform, merged into
+   * lines; then every pair of roughly-parallel line pairs is a candidate page,
+   * scored by how much of each side is covered by real edge segments.
+   * @returns [{ pts, support }]
+   */
+  function lineCandidates(cv, imageData, hand, w, h, minArea, track, debug) {
+    const n = w * h, d = imageData.data;
+    const L = track(new cv.Mat(h, w, cv.CV_8UC1)), B = track(new cv.Mat(h, w, cv.CV_8UC1));
+    const ld = L.data, bd = B.data;
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      ld[i] = lumaOf(d, j);
+      bd[i] = Math.max(0, Math.min(255, 128 + 3 * (cbOf(d, j) - 128)));
+    }
+    const edges = track(new cv.Mat());
+    const tmp = track(new cv.Mat());
+    const ksize = new cv.Size(5, 5);
+    [L, B].forEach((m, k) => {
+      cv.GaussianBlur(m, m, ksize, 0);
+      const med = median(m.data);
+      cv.Canny(m, k ? tmp : edges, Math.max(15, 0.5 * med * (k ? 0.4 : 1)), Math.max(40, Math.min(255, med * (k ? 0.5 : 1.1))));
+    });
+    cv.bitwise_or(edges, tmp, edges);
+    if (hand) {
+      const ed = edges.data;
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          // drop edges on or right next to a hand
+          let near = false;
+          for (let dy = -2; dy <= 2 && !near; dy += 2) {
+            for (let dx = -2; dx <= 2 && !near; dx += 2) {
+              const xx = x + dx, yy = y + dy;
+              if (xx >= 0 && yy >= 0 && xx < w && yy < h && hand[yy * w + xx]) near = true;
+            }
+          }
+          if (near) ed[y * w + x] = 0;
+        }
+      }
+    }
+    const segsMat = track(new cv.Mat());
+    const minLen = Math.round(Math.min(w, h) * 0.1);
+    cv.HoughLinesP(edges, segsMat, 1, Math.PI / 180, 22, minLen, Math.round(w * 0.025));
+    const sd = segsMat.data32S;
+    const segs = [];
+    for (let k = 0; k < segsMat.rows; k++) {
+      const x1 = sd[k * 4], y1 = sd[k * 4 + 1], x2 = sd[k * 4 + 2], y2 = sd[k * 4 + 3];
+      const len = Math.hypot(x2 - x1, y2 - y1);
+      let theta = Math.atan2(y2 - y1, x2 - x1);
+      if (theta < 0) theta += Math.PI;
+      if (theta >= Math.PI) theta -= Math.PI;
+      segs.push({ x1, y1, x2, y2, len, theta });
+    }
+    segs.sort((a, b) => b.len - a.len);
+
+    // Merge collinear segments into lines.
+    const angDiff = (a, b) => { const t = Math.abs(a - b) % Math.PI; return Math.min(t, Math.PI - t); };
+    const lines = [];
+    for (const sg of segs) {
+      const mx = (sg.x1 + sg.x2) / 2, my = (sg.y1 + sg.y2) / 2;
+      let home = null;
+      for (const ln of lines) {
+        if (angDiff(ln.theta, sg.theta) > 0.06) continue;
+        if (Math.abs(ln.l.nx * mx + ln.l.ny * my - ln.l.c) > 3.5) continue;
+        home = ln;
+        break;
+      }
+      if (home) { home.segs.push(sg); home.len += sg.len; }
+      else lines.push({ theta: sg.theta, l: lineThrough({ x: sg.x1, y: sg.y1 }, { x: sg.x2 - sg.x1, y: sg.y2 - sg.y1 }), segs: [sg], len: sg.len });
+    }
+    lines.forEach(ln => {
+      const pts = [];
+      ln.segs.forEach(sg => { for (let t = 0; t <= 1; t += 0.25) pts.push({ x: sg.x1 + (sg.x2 - sg.x1) * t, y: sg.y1 + (sg.y2 - sg.y1) * t }); });
+      ln.l = fitLine(pts);
+    });
+    lines.sort((a, b) => b.len - a.len);
+    const top = lines.slice(0, 24);
+    if (debug) { debug.segments = segs; debug.lineCount = lines.length; }
+
+    // How much of a side (from corner p to corner q) the line's segments cover.
+    const coverage = (ln, p, q) => {
+      const len = dist(p, q);
+      if (len < 1) return 0;
+      const ux = (q.x - p.x) / len, uy = (q.y - p.y) / len;
+      const spans = ln.segs.map(sg => {
+        const a = (sg.x1 - p.x) * ux + (sg.y1 - p.y) * uy, b = (sg.x2 - p.x) * ux + (sg.y2 - p.y) * uy;
+        return [Math.max(0, Math.min(a, b)), Math.min(len, Math.max(a, b))];
+      }).filter(sp => sp[1] > sp[0]).sort((a, b) => a[0] - b[0]);
+      let covered = 0, end = 0;
+      for (const [a, b] of spans) {
+        if (b <= end) continue;
+        covered += b - Math.max(a, end);
+        end = b;
+      }
+      return covered / len;
+    };
+
+    const minSep = Math.min(w, h) * 0.15;
+    const sepAt = (a, b) => Math.abs((a.l.nx * w / 2 + a.l.ny * h / 2 - a.l.c) - (b.l.nx * w / 2 + b.l.ny * h / 2 - b.l.c) * Math.sign(a.l.nx * b.l.nx + a.l.ny * b.l.ny));
+    const pairs = [];
+    for (let i = 0; i < top.length; i++) {
+      for (let j = i + 1; j < top.length; j++) {
+        if (angDiff(top[i].theta, top[j].theta) < 0.5 && sepAt(top[i], top[j]) > minSep) pairs.push([top[i], top[j]]);
+      }
+    }
+    const results = [];
+    const margin = 0.02;
+    for (let a = 0; a < pairs.length; a++) {
+      for (let b = a + 1; b < pairs.length; b++) {
+        const [l1, l2] = pairs[a], [l3, l4] = pairs[b];
+        if (l1 === l3 || l1 === l4 || l2 === l3 || l2 === l4) continue;
+        const cross = angDiff(l1.theta, l3.theta);
+        if (cross < 0.95 || cross > Math.PI - 0.95) continue; // sides meet at 55°..125°
+        const c = [intersect(l1.l, l3.l), intersect(l3.l, l2.l), intersect(l2.l, l4.l), intersect(l4.l, l1.l)];
+        if (c.some(p => !p || p.x < -w * margin || p.y < -h * margin || p.x > w * (1 + margin) || p.y > h * (1 + margin))) continue;
+        const q = orderCorners(c);
+        if (!isConvex(q) || polygonArea(q) < minArea || !looksLikePage(q)) continue;
+        // which line runs along which side
+        const sides = [0, 1, 2, 3].map(k => {
+          const p = q[k], r = q[(k + 1) % 4];
+          const mid = { x: (p.x + r.x) / 2, y: (p.y + r.y) / 2 };
+          let bestL = null, bestD = Infinity;
+          for (const ln of [l1, l2, l3, l4]) {
+            const dd = Math.abs(ln.l.nx * mid.x + ln.l.ny * mid.y - ln.l.c);
+            if (dd < bestD) { bestD = dd; bestL = ln; }
+          }
+          return coverage(bestL, p, r);
+        });
+        const sorted = sides.slice().sort((x, y) => x - y);
+        // One side may be mostly hidden (a hand), but the other three must be real edges.
+        if (sorted[1] < 0.3) continue;
+        const support = sides.reduce((x, y) => x + y) / 4;
+        results.push({ pts: q.map(p => ({ x: Math.min(w - 1, Math.max(0, p.x)), y: Math.min(h - 1, Math.max(0, p.y)) })), support, sides });
+      }
+    }
+    results.sort((x, y) => y.support * Math.sqrt(polygonArea(y.pts)) - x.support * Math.sqrt(polygonArea(x.pts)));
+    if (debug) debug.lineQuads = results.slice(0, 8);
+    return results.slice(0, 8);
+  }
+
+  /**
    * Finds the page in a frame. Candidates come from two places: regions that
    * look like paper (bright, colourless, not skin), and outlines found by Canny
    * edge detection. Each is scored by scoreQuad and the best one wins.
@@ -974,24 +1272,34 @@ const Vision = (() => {
    * `touchesEdge` set when the page runs off the frame), or null.
    */
   function detectQuad(imageData, opts = {}) {
-    const { minAreaRatio = 0.04, debug = null, prior = null, hand = null } = opts;
+    const { minAreaRatio = 0.04, debug = null, prior = null, hand = null, handTracker = false } = opts;
     const cv = window.cv;
     if (!cv || !cv.Mat) return null;
     const w = imageData.width, h = imageData.height;
     const frameArea = w * h;
-    const skin = skinMask(imageData);
-    // A hand mask from the hand tracker (when available) joins the skin mask.
-    if (hand && hand.width === w && hand.height === h) {
-      for (let i = 0; i < frameArea; i++) if (hand.mask[i]) { if (!skin.mask[i]) skin.count++; skin.mask[i] = 1; }
+    // Where the hands are. With the hand tracker running, trust it alone: skin
+    // colour also matches cream walls, wood and warm lighting.
+    let skin;
+    if (handTracker || (hand && hand.width === w && hand.height === h)) {
+      skin = { mask: new Uint8Array(frameArea), count: 0 };
+      if (hand && hand.width === w && hand.height === h) {
+        for (let i = 0; i < frameArea; i++) if (hand.mask[i]) { skin.mask[i] = 1; skin.count++; }
+      }
+      if (!handTracker) { // tracker found nothing but isn't authoritative: add skin colour
+        const sc = handSizedSkin(skinMask(imageData), w, h);
+        for (let i = 0; i < frameArea; i++) if (sc.mask[i] && !skin.mask[i]) { skin.mask[i] = 1; skin.count++; }
+      }
+    } else {
+      skin = handSizedSkin(skinMask(imageData), w, h);
     }
     const skinUsable = skin.count < frameArea * 0.4;
     const noSkin = new Uint8Array(frameArea);
     const paper = paperMask(imageData, skinUsable ? skin.mask : noSkin);
     const candidates = [];
-    const consider = (pts, mask) => {
+    const consider = (pts, mask, lineSupport) => {
       if (!pts) return;
       const area = polygonArea(pts);
-      if (area >= frameArea * minAreaRatio && area < frameArea * 0.985 && looksLikePage(pts)) candidates.push({ pts, mask });
+      if (area >= frameArea * minAreaRatio && area < frameArea * 0.985 && looksLikePage(pts)) candidates.push({ pts, mask, lineSupport });
     };
     let ink = new Uint8Array(frameArea);
 
@@ -1041,7 +1349,17 @@ const Vision = (() => {
       ink = seeded.ink;
       seeded.candidates.forEach(c => consider(c.pts, c.mask));
 
-      // 3. Edge outlines (good on low-contrast backgrounds where colour alone isn't enough).
+      // 3. Pages assembled from straight edge segments.
+      const neutral = new Uint8Array(frameArea); // lenient "could be paper or print": not colourful, not very dark, not a hand
+      for (let i = 0, j = 0; i < frameArea; i++, j += 4) {
+        const r = imageData.data[j], g = imageData.data[j + 1], b = imageData.data[j + 2];
+        const max = Math.max(r, g, b), min = Math.min(r, g, b);
+        neutral[i] = max > 45 && (max - min) / max < 0.3 && !(skinUsable && skin.mask[i]) ? 1 : 0;
+      }
+      const lineCands = lineCandidates(cv, imageData, skinUsable ? skin.mask : null, w, h, frameArea * minAreaRatio, track, debug);
+      lineCands.forEach(c => consider(c.pts, 'tint', c.support));
+
+      // 4. Edge outlines (good on low-contrast backgrounds where colour alone isn't enough).
       const gray = track(new cv.Mat());
       const edges = track(new cv.Mat());
       cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
@@ -1070,14 +1388,14 @@ const Vision = (() => {
     } finally {
       mats.forEach(m => m.delete());
     }
-    // 4. The previous frame's page, re-checked on this frame (temporal prior, as in SmartDoc's best entries).
+    // 5. The previous frame's page, re-checked on this frame (temporal prior, as in SmartDoc's best entries).
     if (prior) consider(prior.map(p => ({ x: p.x, y: p.y })));
 
     const handInfo = { mask: skinUsable ? skin.mask : noSkin, width: w, height: h };
-    const scored = candidates.map(c => scoreQuad(c.pts, c.mask || paper.strict, paper.Y, ink, w, h));
+    const scored = candidates.map(c => scoreQuad(c.pts, c.mask || paper.strict, paper.Y, ink, w, h, imageData));
     // Re-rank the top candidates by edge support after snapping them to the page edges (Tropin et al.).
     const top = scored.map((s, i) => ({ s, i })).filter(x => x.s.score > 0)
-      .sort((a, b) => b.s.score - a.s.score).slice(0, 4);
+      .sort((a, b) => b.s.score - a.s.score).slice(0, 10);
     const diag = Math.hypot(w, h);
     let best = null;
     for (const { s } of top) {
@@ -1085,7 +1403,10 @@ const Vision = (() => {
       s.quad = r.quad;
       s.support = r.support;
       s.meanSupport = r.meanSupport;
-      let score = s.score * (0.4 + 0.6 * r.meanSupport);
+      s.rim = rimScore(imageData, r.quad, skinUsable ? skin.mask : null);
+      if (s.rim < 0.7) { s.reason = 'border isn\'t a page edge'; continue; } // needs ~3 real page-border sides
+      // A side that isn't a real page border (a printed table line, a wall edge) costs a lot.
+      let score = s.score * (0.4 + 0.6 * r.meanSupport) * Math.pow(s.rim, 4);
       if (prior) {
         const pq = orderCorners(prior);
         const dMean = s.quad.reduce((acc, p, k) => acc + dist(p, pq[k]), 0) / 4;
@@ -1248,89 +1569,196 @@ const Vision = (() => {
   // Clean-up filters
   // -------------------------------------------------------------------------
 
-  /** Separable max filter on one RGBA channel, in place. */
-  function dilateChannel(d, w, h, ch, r) {
-    const tmp = new Uint8ClampedArray(w * h);
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        let m = 0;
-        for (let k = Math.max(0, x - r); k <= Math.min(w - 1, x + r); k++) m = Math.max(m, d[(y * w + k) * 4 + ch]);
-        tmp[y * w + x] = m;
-      }
-    }
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        let m = 0;
-        for (let k = Math.max(0, y - r); k <= Math.min(h - 1, y + r); k++) m = Math.max(m, tmp[k * w + x]);
-        d[(y * w + x) * 4 + ch] = m;
-      }
-    }
-  }
-
   /**
-   * Estimates how bright the paper is at every point (the lighting), by
-   * shrinking the page and erasing the ink with a max filter.
-   * Dividing by this removes shadows and uneven light.
+   * Estimates the paper's colour at every point (the lighting) so it can be
+   * divided out, removing shadows and uneven light.
+   *
+   * The page is split into cells; each cell's paper colour is the average of
+   * its brightest pixels (ink is darker). Cells that are much darker than the
+   * paper around them are print, not shadow: a filled box, a dark header bar,
+   * a shaded table cell. Those cells are left out and filled in from the
+   * neighbouring paper, so dark print stays dark instead of being "corrected"
+   * to white.
+   * @returns {Float32Array} RGB paper estimate per pixel (3 values per pixel)
    */
   function estimatePaper(canvas) {
     const w = canvas.width, h = canvas.height;
-    const k = Math.max(w, h) / 96;
-    const sw = Math.max(8, Math.round(w / k)), sh = Math.max(8, Math.round(h / k));
-    // Two-step shrink so the browser averages pixels rather than skipping them.
-    const mid = createCanvas(sw * 4, sh * 4);
-    const mctx = ctx2d(mid);
-    mctx.imageSmoothingQuality = 'high';
-    mctx.drawImage(canvas, 0, 0, mid.width, mid.height);
-    const small = createCanvas(sw, sh);
-    const sctx = ctx2d(small);
-    sctx.imageSmoothingQuality = 'high';
-    sctx.drawImage(mid, 0, 0, sw, sh);
-
-    const img = sctx.getImageData(0, 0, sw, sh);
-    for (let ch = 0; ch < 3; ch++) dilateChannel(img.data, sw, sh, ch, 2);
-    sctx.putImageData(img, 0, 0);
-
+    const d = ctx2d(canvas).getImageData(0, 0, w, h).data;
+    const cell = Math.max(6, Math.round(Math.max(w, h) / 48));
+    const gw = Math.ceil(w / cell), gh = Math.ceil(h / cell), cells = gw * gh;
+    const col = new Float32Array(cells * 3), lum = new Float32Array(cells);
+    const hist = new Uint32Array(256);
+    for (let cy = 0; cy < gh; cy++) {
+      for (let cx = 0; cx < gw; cx++) {
+        hist.fill(0);
+        const x0 = cx * cell, y0 = cy * cell, x1 = Math.min(w, x0 + cell), y1 = Math.min(h, y0 + cell);
+        let n = 0;
+        for (let y = y0; y < y1; y += 2) for (let x = x0; x < x1; x += 2) { const j = (y * w + x) * 4; hist[lumaOf(d, j)]++; n++; }
+        let cut = 255;
+        for (let v = 255, acc = 0; v >= 0; v--) { acc += hist[v]; if (acc >= n * 0.15) { cut = v; break; } }
+        let r = 0, g = 0, b = 0, m = 0;
+        for (let y = y0; y < y1; y += 2) {
+          for (let x = x0; x < x1; x += 2) {
+            const j = (y * w + x) * 4;
+            if (lumaOf(d, j) >= cut) { r += d[j]; g += d[j + 1]; b += d[j + 2]; m++; }
+          }
+        }
+        const c = cy * gw + cx;
+        col[c * 3] = r / m; col[c * 3 + 1] = g / m; col[c * 3 + 2] = b / m;
+        lum[c] = (col[c * 3] * 77 + col[c * 3 + 1] * 150 + col[c * 3 + 2] * 29) / 256;
+      }
+    }
+    // Paper or print? Compare each cell with the paper level around it and on the whole page.
+    const sortedLum = Array.from(lum).sort((a, b) => a - b);
+    const pageLevel = sortedLum[Math.floor(sortedLum.length * 0.75)];
+    let known = new Uint8Array(cells);
+    const R = 3;
+    for (let cy = 0; cy < gh; cy++) {
+      for (let cx = 0; cx < gw; cx++) {
+        const around = [];
+        for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
+          const xx = cx + dx, yy = cy + dy;
+          if ((dx || dy) && xx >= 0 && yy >= 0 && xx < gw && yy < gh) around.push(lum[yy * gw + xx]);
+        }
+        around.sort((a, b) => a - b);
+        const local = around.length ? around[Math.floor(around.length * 0.75)] : pageLevel;
+        const c = cy * gw + cx;
+        known[c] = lum[c] >= 0.88 * local && lum[c] >= 0.78 * pageLevel ? 1 : 0;
+      }
+    }
+    // Fill print cells from neighbouring paper.
+    let colour = col;
+    for (let pass = 0; pass < gw + gh; pass++) {
+      const next = colour.slice(), nextKnown = known.slice();
+      let missing = 0;
+      for (let cy = 0; cy < gh; cy++) {
+        for (let cx = 0; cx < gw; cx++) {
+          const c = cy * gw + cx;
+          if (known[c]) continue;
+          let r = 0, g = 0, b = 0, k = 0;
+          for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+            const xx = cx + dx, yy = cy + dy;
+            if (xx < 0 || yy < 0 || xx >= gw || yy >= gh) continue;
+            const nc = yy * gw + xx;
+            if (!known[nc]) continue;
+            r += colour[nc * 3]; g += colour[nc * 3 + 1]; b += colour[nc * 3 + 2]; k++;
+          }
+          if (k) { next[c * 3] = r / k; next[c * 3 + 1] = g / k; next[c * 3 + 2] = b / k; nextKnown[c] = 1; } else missing++;
+        }
+      }
+      colour = next; known = nextKnown;
+      if (!missing) break;
+    }
+    // Smooth, then scale up to full size (bilinear).
+    const sm = createCanvas(gw, gh);
+    const sctx = ctx2d(sm);
+    const simg = sctx.createImageData(gw, gh);
+    for (let c = 0; c < cells; c++) {
+      let r = 0, g = 0, b = 0, k = 0;
+      const cx = c % gw, cy = (c / gw) | 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const xx = cx + dx, yy = cy + dy;
+        if (xx < 0 || yy < 0 || xx >= gw || yy >= gh) continue;
+        const nc = yy * gw + xx;
+        r += colour[nc * 3]; g += colour[nc * 3 + 1]; b += colour[nc * 3 + 2]; k++;
+      }
+      simg.data[c * 4] = r / k; simg.data[c * 4 + 1] = g / k; simg.data[c * 4 + 2] = b / k; simg.data[c * 4 + 3] = 255;
+    }
+    sctx.putImageData(simg, 0, 0);
     const big = createCanvas(w, h);
     const bctx = ctx2d(big);
     bctx.imageSmoothingQuality = 'high';
-    bctx.filter = 'blur(' + Math.max(2, Math.round(k * 2)) + 'px)';
-    bctx.drawImage(small, 0, 0, w, h);
+    bctx.drawImage(sm, 0, 0, w, h);
     return bctx.getImageData(0, 0, w, h).data;
   }
 
-  // Maps normalised brightness to output: deepens ink, pushes paper to white.
-  const LEVELS = (() => {
-    const lut = new Uint8ClampedArray(256);
-    for (let v = 0; v < 256; v++) {
-      const t = Math.min(1, Math.max(0, (v - 25) / (235 - 25)));
-      lut[v] = Math.round(Math.pow(t, 1.25) * 255);
+  /** Box blur of a single-channel float image (separable, running sums). */
+  function boxBlur(src, w, h, r) {
+    const tmp = new Float32Array(w * h), out = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) {
+      let acc = 0;
+      const row = y * w;
+      for (let x = -r; x <= r; x++) acc += src[row + Math.min(w - 1, Math.max(0, x))];
+      for (let x = 0; x < w; x++) {
+        tmp[row + x] = acc / (2 * r + 1);
+        acc += src[row + Math.min(w - 1, x + r + 1)] - src[row + Math.max(0, x - r)];
+      }
     }
-    return lut;
-  })();
+    for (let x = 0; x < w; x++) {
+      let acc = 0;
+      for (let y = -r; y <= r; y++) acc += tmp[Math.min(h - 1, Math.max(0, y)) * w + x];
+      for (let y = 0; y < h; y++) {
+        out[y * w + x] = acc / (2 * r + 1);
+        acc += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x];
+      }
+    }
+    return out;
+  }
 
   /**
+   * Scanner-style clean-up.
+   *  - enhanced: lighting divided out (paper → white, colours kept), text sharpened and darkened
+   *  - gray:     the same in greyscale
+   *  - bw:       black and white; local thresholding keeps text inside shaded table cells,
+   *              and large dark print (filled boxes) stays black
    * @param {'enhanced'|'original'|'gray'|'bw'} filter
    */
   function applyFilter(canvas, filter) {
     if (!filter || filter === 'original') return canvas;
-    const w = canvas.width, h = canvas.height;
+    const w = canvas.width, h = canvas.height, n = w * h;
     const ctx = ctx2d(canvas);
     const img = ctx.getImageData(0, 0, w, h);
     const d = img.data;
     const paper = estimatePaper(canvas);
 
-    for (let i = 0; i < d.length; i += 4) {
-      const r = Math.min(255, d[i] * 255 / Math.max(paper[i], 24));
-      const g = Math.min(255, d[i + 1] * 255 / Math.max(paper[i + 1], 24));
-      const b = Math.min(255, d[i + 2] * 255 / Math.max(paper[i + 2], 24));
-      if (filter === 'enhanced') {
-        d[i] = LEVELS[r | 0];
-        d[i + 1] = LEVELS[g | 0];
-        d[i + 2] = LEVELS[b | 0];
-      } else {
-        const y = (r * 77 + g * 150 + b * 29) >> 8;
-        const v = filter === 'bw' ? (y < 200 ? 0 : 255) : LEVELS[y];
-        d[i] = d[i + 1] = d[i + 2] = v;
+    // 1. Divide out the lighting: paper becomes 1.0 in every channel.
+    const R = new Float32Array(n), G = new Float32Array(n), B = new Float32Array(n), L = new Float32Array(n);
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      R[i] = Math.min(1.1, d[j] / Math.max(paper[j], 20));
+      G[i] = Math.min(1.1, d[j + 1] / Math.max(paper[j + 1], 20));
+      B[i] = Math.min(1.1, d[j + 2] / Math.max(paper[j + 2], 20));
+      L[i] = 0.299 * R[i] + 0.587 * G[i] + 0.114 * B[i];
+    }
+    // 2. Unsharp mask on brightness: webcam text is soft.
+    const radius = Math.max(1, Math.round(Math.max(w, h) / 600));
+    const blurred = boxBlur(L, w, h, radius);
+    const sharp = new Float32Array(n);
+    for (let i = 0; i < n; i++) sharp[i] = L[i] + 1.2 * (L[i] - blurred[i]);
+
+    // 3. Tone curve: the darkest print → black, paper → white, faint text darkened.
+    const hist = new Uint32Array(256);
+    for (let i = 0; i < n; i += 3) hist[Math.max(0, Math.min(255, Math.round(L[i] * 230)))]++;
+    let black = 0, total = 0;
+    for (let v = 0; v < 256; v++) total += hist[v];
+    for (let v = 0, acc = 0; v < 256; v++) { acc += hist[v]; if (acc >= total * 0.01) { black = v / 230; break; } }
+    black = Math.min(0.45, black);
+    const white = 0.93;
+    const tone = v => { const t = Math.min(1, Math.max(0, (v - black) / (white - black))); return Math.pow(t, 1.5); };
+
+    if (filter === 'bw') {
+      // Sauvola thresholding (local mean and spread): faint text inside a shaded
+      // table cell still comes out black, the shading itself white, and large
+      // dark print (filled boxes) stays black.
+      const r = Math.max(4, Math.round(Math.max(w, h) / 80));
+      const sq = new Float32Array(n);
+      for (let i = 0; i < n; i++) sq[i] = sharp[i] * sharp[i];
+      const mean = boxBlur(sharp, w, h, r), meanSq = boxBlur(sq, w, h, r);
+      for (let i = 0, j = 0; i < n; i++, j += 4) {
+        const sd = Math.sqrt(Math.max(0, meanSq[i] - mean[i] * mean[i]));
+        const t = mean[i] * (1 + 0.1 * (sd / 0.5 - 1));
+        const ink = sharp[i] < 0.45 || sharp[i] < t;
+        d[j] = d[j + 1] = d[j + 2] = ink ? 0 : 255;
+      }
+    } else if (filter === 'gray') {
+      for (let i = 0, j = 0; i < n; i++, j += 4) d[j] = d[j + 1] = d[j + 2] = Math.round(255 * tone(sharp[i]));
+    } else {
+      for (let i = 0, j = 0; i < n; i++, j += 4) {
+        // Apply the tone change to brightness and keep each pixel's colour ratio.
+        const target = tone(sharp[i]);
+        const k = L[i] > 0.02 ? target / L[i] : 0;
+        d[j] = Math.max(0, Math.min(255, Math.round(255 * R[i] * k)));
+        d[j + 1] = Math.max(0, Math.min(255, Math.round(255 * G[i] * k)));
+        d[j + 2] = Math.max(0, Math.min(255, Math.round(255 * B[i] * k)));
       }
     }
     ctx.putImageData(img, 0, 0);
@@ -1341,6 +1769,6 @@ const Vision = (() => {
     createCanvas, ctx2d, orderCorners, fullFrame, polygonArea,
     toGray, meanAbsDiff, sharpness,
     detectQuad, warp, rotate, applyFilter, quadSize, removeFingers,
-    refineQuad, estimateAspect, maskCoverage, locatePage, shrinkTo, inset, skinMask
+    refineQuad, estimateAspect, maskCoverage, locatePage, shrinkTo, inset, skinMask, rimScore
   };
 })();
