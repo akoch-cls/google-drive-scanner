@@ -168,6 +168,18 @@
   .debug canvas { width: 100%; border-radius: 6px; background: #000; }
   .debug-legend { display: flex; flex-wrap: wrap; gap: 4px 10px; }
   .debug-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+  .debug .btn.ghost.debug-rec { color: #fff; border-color: rgba(255, 255, 255, .35); }
+  .debug .btn.ghost.debug-rec:hover:not(:disabled) { background: rgba(255, 255, 255, .12); }
+  .debug .btn.ghost.debug-rec.recording, .debug .btn.ghost.debug-rec.recording:hover:not(:disabled) { background: #d93025; border-color: #d93025; }
+  .debug-note { margin: 0; color: #8d97a6; font-size: 11px; line-height: 1.4; }
+  .rec-badge {
+    position: absolute; left: 50%; top: 56px; transform: translateX(-50%); z-index: 3;
+    padding: 8px 16px; border-radius: 99px; background: rgba(10, 14, 20, .75); color: #fff; font-weight: 700;
+    display: flex; align-items: center; gap: 8px; white-space: nowrap;
+  }
+  .rec-badge .rec-dot { width: 10px; height: 10px; border-radius: 50%; background: #ff3b30; animation: blink 1s steps(2, start) infinite; }
+  .rec-badge.countdown { font-size: 22px; padding: 10px 22px; }
+  @keyframes blink { to { visibility: hidden; } }
   .debug pre { margin: 0; font: 11px/1.4 ui-monospace, Menlo, monospace; white-space: pre-wrap; color: #b8c1cf; }
   .drop-hint { background: rgba(26, 115, 232, .85); font-size: 20px; font-weight: 600; border: 3px dashed #fff; border-radius: var(--radius); }
 

@@ -64,7 +64,7 @@
     'resultIcon', 'resultTitle', 'resultBody', 'resultActions', 'teacherModal', 'tCourse', 'tCreate', 'tLink',
     'tTitle', 'tDesc', 'tDue', 'tPoints', 'tCreateBtn', 'tWorkList', 'tResult', 'tError', 'tBusy', 'helpModal',
     'toast', 'toastText', 'toastAction', 'edFingers', 'macTip', 'macTipClose',
-    'debugPanel', 'debugClose', 'debugCanvas', 'debugText', 'debugSave', 'signInBtn', 'account', 'accountEmail', 'signOutBtn'
+    'debugPanel', 'debugClose', 'debugCanvas', 'debugText', 'debugSave', 'debugRecord', 'recBadge', 'signInBtn', 'account', 'accountEmail', 'signOutBtn'
   ].forEach(id => { el[id] = $(id); });
 
   const state = {
@@ -74,6 +74,7 @@
     autoEnabled: true,
     defaultFilter: 'enhanced',
     removeFingers: true,
+    rec: null,           // clip recording in progress: { recorder, chunks, started, timer, mime }
     debug: false,        // troubleshooting view (press D, or open with ?debug)
     capturing: false,
     loopTimer: null,
@@ -307,6 +308,7 @@
   }
 
   function stopCamera() {
+    if (state.rec) { if (state.rec.recorder && state.rec.recorder.state === 'recording') state.rec.recorder.stop(); else cancelClip(); }
     clearTimeout(state.loopTimer);
     if (state.stream) state.stream.getTracks().forEach(t => t.stop());
     state.stream = null;
@@ -545,7 +547,7 @@
     a.count = ready ? a.count + 1 : 0;
     const progress = state.autoEnabled && a.armed ? Math.min(1, a.count / CONFIG.autoFrames) : 0;
     el.captureBtn.style.setProperty('--p', progress.toFixed(2));
-    if (state.autoEnabled && a.armed && a.count >= CONFIG.autoFrames) capture();
+    if (state.autoEnabled && a.armed && a.count >= CONFIG.autoFrames && !state.rec) capture();
   }
 
   // ===========================================================================
@@ -611,19 +613,124 @@
     const c = Vision.createCanvas(v.videoWidth, v.videoHeight);
     c.getContext('2d').drawImage(v, 0, 0);
     c.toBlob(blob => {
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = 'scanner-frame-' + new Date().toISOString().replace(/[:.]/g, '-') + '.jpg';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-      toast('Saved ' + a.download);
+      const name = 'scanner-frame-' + new Date().toISOString().replace(/[:.]/g, '-') + '.jpg';
+      download(blob, name);
+      toast('Saved ' + name);
     }, 'image/jpeg', 0.92);
+  }
+
+  // ---- Clip recorder: a few seconds of raw camera video, for developing the sweep scanner ----
+
+  const CLIP_MAX_MS = 20000;
+  const CLIP_COUNTDOWN = 3;
+
+  function clipMime() {
+    const types = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4;codecs=avc1', 'video/mp4'];
+    return types.find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || '';
+  }
+
+  function download(blob, name) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  }
+
+  function showRecBadge(html, countdown) {
+    el.recBadge.innerHTML = html;
+    el.recBadge.classList.toggle('countdown', !!countdown);
+    el.recBadge.classList.remove('hidden');
+  }
+
+  function hideRecBadge() {
+    el.recBadge.classList.add('hidden');
+  }
+
+  function toggleClip() {
+    if (state.rec) {
+      if (state.rec.recorder) state.rec.recorder.stop();
+      else cancelClip();
+      return;
+    }
+    if (!window.MediaRecorder || !clipMime()) {
+      toast("This browser can't record video. Try Chrome, Edge or Safari.");
+      return;
+    }
+    if (!state.stream || !el.video.videoWidth) {
+      toast('Start the camera first.');
+      return;
+    }
+    // Countdown first, so there's time to pick up the page.
+    const rec = state.rec = { countdown: CLIP_COUNTDOWN, timer: null, recorder: null, chunks: [] };
+    el.debugRecord.textContent = 'Cancel';
+    el.debugRecord.classList.add('recording');
+    const tickDown = () => {
+      if (state.rec !== rec) return;
+      if (rec.countdown > 0) {
+        showRecBadge('Recording in ' + rec.countdown + '…', true);
+        rec.countdown--;
+        rec.timer = setTimeout(tickDown, 1000);
+      } else {
+        startRecording(rec);
+      }
+    };
+    tickDown();
+  }
+
+  function cancelClip() {
+    if (!state.rec) return;
+    clearTimeout(state.rec.timer);
+    clearInterval(state.rec.clock);
+    state.rec = null;
+    hideRecBadge();
+    el.debugRecord.textContent = 'Record clip';
+    el.debugRecord.classList.remove('recording');
+  }
+
+  function startRecording(rec) {
+    const mime = clipMime();
+    let recorder;
+    try {
+      recorder = new MediaRecorder(state.stream, { mimeType: mime, videoBitsPerSecond: 16000000 });
+    } catch (err) {
+      cancelClip();
+      toast("Couldn't start recording: " + err.message);
+      return;
+    }
+    rec.recorder = recorder;
+    rec.mime = mime;
+    rec.started = performance.now();
+    recorder.ondataavailable = e => { if (e.data && e.data.size) rec.chunks.push(e.data); };
+    recorder.onstop = () => {
+      const settings = state.stream ? state.stream.getVideoTracks()[0].getSettings() : {};
+      const seconds = ((performance.now() - rec.started) / 1000).toFixed(1);
+      cancelClip();
+      if (!rec.chunks.length) { toast('Nothing was recorded.'); return; }
+      const blob = new Blob(rec.chunks, { type: mime.split(';')[0] });
+      const ext = mime.startsWith('video/mp4') ? 'mp4' : 'webm';
+      const size = (settings.width && settings.height) ? '-' + settings.width + 'x' + settings.height : '';
+      const name = 'scanner-clip-' + new Date().toISOString().replace(/[:.]/g, '-') + size + '.' + ext;
+      download(blob, name);
+      toast('Saved ' + name + ' (' + seconds + ' s, ' + formatBytes(blob.size) + ')', null, null, 6000);
+    };
+    recorder.onerror = () => { cancelClip(); toast('Recording failed.'); };
+    recorder.start(1000);
+    el.debugRecord.textContent = 'Stop recording';
+    const clock = () => {
+      const ms = performance.now() - rec.started;
+      showRecBadge('<span class="rec-dot"></span>REC ' + (ms / 1000).toFixed(0) + ' s — raise the page slowly');
+      if (ms >= CLIP_MAX_MS && recorder.state === 'recording') recorder.stop();
+    };
+    clock();
+    rec.clock = setInterval(clock, 250);
   }
 
   el.debugClose.addEventListener('click', () => setDebug(false));
   el.debugSave.addEventListener('click', saveDebugFrame);
+  el.debugRecord.addEventListener('click', toggleClip);
 
   function setStatus(text, kind) {
     if (el.statusText.textContent !== text) el.statusText.textContent = text;

@@ -61,6 +61,7 @@
           </div>
         </div>
         <div class="drop-hint hidden" id="dropHint">Drop photos to add them as pages</div>
+        <div class="rec-badge hidden" id="recBadge" role="status"></div>
         <div class="debug hidden" id="debugPanel">
           <div class="debug-head"><b>What the scanner sees</b><button class="icon-btn" id="debugClose" type="button" aria-label="Close troubleshooting view">×</button></div>
           <canvas id="debugCanvas"></canvas>
@@ -70,6 +71,9 @@
           </div>
           <pre id="debugText"></pre>
           <button class="btn primary small block" id="debugSave" type="button">Save camera frame</button>
+          <button class="btn ghost small block debug-rec" id="debugRecord" type="button">Record clip</button>
+          <p class="debug-note">Record clip: after a 3-second countdown, hold the page close with its top in view and raise it slowly
+            (about 5 seconds) until the bottom has passed the camera. Click again to stop (stops by itself after 20 seconds).</p>
         </div>
       </div>
 
